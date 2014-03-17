@@ -6,6 +6,9 @@ __author__ = 'Antoine Monnet antoine.monnet@sfr.com'
 __copyright__ = 'Copyright (c) 2014 SFR (http://www.sfr.com)'
 __license__ = 'GNU LESSER GENERAL PUBLIC LICENSE Version 2.1'
 
+import sys
+print sys.path
+
 import upnpy
 from upnpy.device import BaseService, BaseDevice, StateVariable, action, ActionError, _TextElement, _getURL
 import upnpy.utils

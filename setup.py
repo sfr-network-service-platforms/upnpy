@@ -1,4 +1,4 @@
-from setuptools import setup
+from distutils.core import setup
 
 def readme():
     with open('README.md') as f:
@@ -20,10 +20,12 @@ setup(name='upnpy',
       author_email='antoine.monnet@sfr.com',
       license='LGPL',
       packages=['upnpy'],
-      extras_requires={
-        'openssl':['OpenSSL'],
-        'm2crypto':['M2Crypto'],
-        'console_browser':['urwid', 'bpython'],
-        },
-      include_package_data=True,
-      zip_safe=False)
+      # extras_requires={
+      #   'openssl':['OpenSSL'],
+      #   'm2crypto':['M2Crypto'],
+      #   'console_browser':['urwid', 'bpython'],
+      #   },
+      #include_package_data=True,
+      #zip_safe=False,
+      )
+
