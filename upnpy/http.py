@@ -60,10 +60,10 @@ class HTTPServer(LoggedDispatcher, asyncore.dispatcher):
         if not conn_addr: return
 
         if self.ssl:
-            from ussl import SSLHTTPConnection
-            SSLHTTPConnection(self, *conn_addr)
+            from ussl import SSLHTTPServerConnection
+            SSLHTTPServerConnection(self, *conn_addr)
         else:
-            HTTPConnection(self, *conn_addr)
+            HTTPServerConnection(self, *conn_addr)
 
     def handle_request(self, request):
 
@@ -124,6 +124,7 @@ class _HTTPMessage(object):
         self.body = body
 
         self._discard_body = False
+        self.sent = False
 
     def next(self, connection):
         if not hasattr(self, '_generator'):
@@ -151,7 +152,7 @@ class _HTTPMessage(object):
                 try:
                     yield next(self.body)
                 except StopIteration:
-                    break        
+                    break
 
     # def send_response(self, code, message=None, headers=None, body=None):
     #     self.send_responseline(code, message)
@@ -320,6 +321,7 @@ class HTTPRequest(_HTTPMessage):
         else:
             raise ValueError("neither firstline nor (command,path) set!")
 
+        self.callback = None
         self.response = None
 
     def parse_requestline(self):
@@ -361,6 +363,11 @@ class HTTPRequest(_HTTPMessage):
         self.connection.handle_write_event()
         #self.connection.initiate_send()
 
+    def handle_response(self, message):
+        self.response = response
+        if callable(self.callback):
+            self.callback(response)
+
 class HTTPResponse(_HTTPMessage):
 
     def __init__(self, code=None, message=None, *args, **kwargs):
@@ -399,21 +406,18 @@ def terminator(term=None):
         return fct
     return terminator_handler
 
-class HTTPConnection(LoggedDispatcher,asynchat.async_chat):
+class _HTTPConnection(LoggedDispatcher,asynchat.async_chat):
 
     KEEP_ALIVE = 10
     REQUEST_CLASS = HTTPRequest
     RESPONSE_CLASS = HTTPResponse
 
-    def __init__(self, server, sock, remote_address, client=False):
+    def __init__(self, server, sock, remote_address):
         self.server = server
         self.remote_address = remote_address
-        self.client = client
 
         asynchat.async_chat.__init__(self, sock, map=server._map)
         LoggedDispatcher.__init__(self, self.__class__.__name__+'.%s:%d'%(sock.getsockname() if sock else remote_address))
-
-        self.set_next_message()
 
         self.message = None
         self.pipeline = []
@@ -427,11 +431,6 @@ class HTTPConnection(LoggedDispatcher,asynchat.async_chat):
         self.last_activity = time.time()
         self.set_idle_handler()
 
-    def set_idle_handler(self):
-
-        u = self.server if self.client else self.server.upnpy
-        self._idle_handle = u.set_idle(_IdleHandler(u, self))
-
     def idle(self):
         if time.time() > self.last_activity + self.keep_alive:
             self.logger.info('closing idle connection')
@@ -441,12 +440,13 @@ class HTTPConnection(LoggedDispatcher,asynchat.async_chat):
         asynchat.async_chat.create_socket(self, socket.AF_INET, socket.SOCK_STREAM)
 
     def reconnect(self):
-        conn = self.__class__(self.server, None, self.remote_address, client=self.client)
+        conn = self.__class__(self.server, None, self.remote_address)
         conn.create_socket()
         return conn
 
-    def send_request(self, request):        
+    def send_request(self, request):
         self.pipeline.append(request)
+        self.logger.info('send_request %s on %s', request, self)
         self.handle_write_event()
         #self.initiate_send()
 
@@ -455,18 +455,12 @@ class HTTPConnection(LoggedDispatcher,asynchat.async_chat):
 
     def set_next_handler(self, handler, terminator = None):
         
-        #if isinstance(self, SSLHTTPConnection):
+        #if self.__class__.__name__ == 'SSLHTTPConnection':
         #    self.logger.info("set_next_handler '%s' '%s'", self.found_terminator, self.read_data)
 
         self.read_data = ""
         self.found_terminator = handler
         self.set_terminator(terminator or handler.terminator)
-
-    def set_next_message(self):
-        if self.client:
-            self.set_next_handler(self.found_response)
-        else:
-            self.set_next_handler(self.found_request)
 
     @terminator("\r\n")
     def found_request(self):
@@ -531,87 +525,6 @@ class HTTPConnection(LoggedDispatcher,asynchat.async_chat):
     def found_chunk_end(self):
         self.set_next_handler(self.found_chunk_size)
 
-    def handle_message(self):        
-        self.read_data = ""
-        message = self.message
-        del self.message
-
-        self.set_next_message()
-
-        if self.client:
-            if message.headers.get('Connection', 'close').lower() != 'keep-alive':
-                self.handle_close()
-            else:
-                self.pipelining = True
-
-            req = self.pipeline.pop(0)
-            if req.callback:
-                try:
-                    req.callback(message)
-                except Exception, e:
-                    self.logger.exception("handle_request failed")
-            else:
-                req.response = self.message                
-        else:
-            try:
-                self.server.handle_request(message)
-            except Exception, e:
-                self.logger.exception("handle_request failed")
-                message.respond(500)
-            #    raise
-
-        ##if not self.client:
-        #   if message.headers.get('Connection', 'close').lower() == 'keep-alive':
-        #        self.set_next_handler(self.found_message, '\r\n')
-        #    else:
-        #        self.close()
-
-    # def push (self, data):
-    #     sabs = self.ac_out_buffer_size
-    #     if len(data) > sabs:
-    #         for i in xrange(0, len(data), sabs):
-    #             self.producer_fifo.append(data[i:i+sabs])
-    #     else:
-    #         self.producer_fifo.append(data)
-
-    def initiate_send(self):
-        obs = self.ac_out_buffer_size
-       
-        close = False
-        while self.connected and len(self.write_data) < obs and self.pipeline:
-            try:
-                if self.client:
-                    n = self.pipeline[0].next(self)
-                elif self.pipeline[0].response:
-                    n = self.pipeline[0].response.next(self)
-                else:
-                    break
-            except StopIteration:
-                if not self.client:
-                    self.pipeline.pop(0)
-                break
-            if n == Wait:
-                break
-            elif n == Close:
-                close = True
-                break
-            else:
-                self.write_data += n                 
-        try:
-            sent = self.send(self.write_data)
-
-        except socket.error:
-            self.handle_error()
-            return
-        
-        if close:
-            self.handle_close()
-
-        self.write_data = self.write_data[max(sent,0):]                    
-
-    def writable(self):
-        return self.write_data or self.pipeline
-
     def getsockname(self):
         return self.socket.getsockname()
 
@@ -620,25 +533,154 @@ class HTTPConnection(LoggedDispatcher,asynchat.async_chat):
 
     def handle_read_event(self):
         self.last_activity = time.time()
-        try:
-            asynchat.async_chat.handle_read_event(self)
-        except socket.error, e:
-            if self.client:
-                self.message = self.REQUEST_CLASS(self,
-                                                  firstline="HTTP/1.0 %d %s"  % (-e.args[0], str(e)),
-                                                  response=True)
-                if self.callback:
-                    self.callback(self.message)
+        asynchat.async_chat.handle_read_event(self)
 
     def handle_write_event(self):
         self.last_activity = time.time()
         asynchat.async_chat.handle_write_event(self)
 
+class HTTPClientConnection(_HTTPConnection):
+
+    def __init__(self, *args, **kwargs):
+        _HTTPConnection.__init__(self, *args, **kwargs)
+        self.set_next_handler(self.found_response)
+
+    def set_idle_handler(self):
+
+        upnpy = self.server
+        self._idle_handle = upnpy.set_idle(_IdleHandler(upnpy, self))
+
+    def handle_message(self):        
+        message = self.message
+        del self.message
+
+        self.set_next_handler(self.found_response)
+
+        if message.headers.get('Connection', 'close').lower() != 'keep-alive':
+            self.handle_close()
+        else:
+            self.pipelining = True
+
+        self.logger.info('receive response %s on %s', message, self)
+        req = self.pipeline.pop(0)
+        req.handle_response(message)
+
+    def initiate_send(self):
+        obs = self.ac_out_buffer_size
+       
+        close = False
+
+        iterpipe = self.pipeline       
+        notsent = filter(lambda request:request.sent==False, self.pipeline)
+
+        while self.connected and len(self.write_data) < obs and notsent:
+
+            try:
+                n = notsent[0].next(self)
+            except StopIteration:
+                notsent[0].sent = True
+                break
+
+            if n == Wait:
+                break
+            elif n == Close:
+                close = True
+                break
+            else:
+                self.write_data += n                 
+
+        if not self.write_data:
+            return
+
+        try:
+            sent = self.send(self.write_data)
+            self.write_data = self.write_data[max(sent,0):]
+        except socket.error:
+            self.handle_error()
+            return
+        
+        if close:
+            self.handle_close()
+
+    def writable(self):
+        return self.write_data \
+            or any(map(lambda request:request.sent==False, self.pipeline))
+
+    def handle_close(self):
+        _HTTPConnection.handle_close(self)
+        if hasattr(self, '_idle_handle'):
+            upnpy = self.server
+            upnpy.remove_idle(self._idle_handle)
+        while self.pipeline:
+            self.pipeline.pop().handle_response(self.RESPONSE_CLASS(code=0, message="connection closed"))
+
+class HTTPServerConnection(_HTTPConnection):
+
+    def __init__(self, *args, **kwargs):
+        _HTTPConnection.__init__(self, *args, **kwargs)
+        self.set_next_handler(self.found_request)
+
+    def set_idle_handler(self):
+
+        upnpy = self.server.upnpy
+        self._idle_handle = upnpy.set_idle(_IdleHandler(upnpy, self))
+
+    def handle_message(self):        
+        message = self.message
+        del self.message
+
+        self.set_next_handler(self.found_request)
+
+        try:
+            self.server.handle_request(message)
+        except Exception, e:
+            self.logger.exception("handle_request failed")
+            message.respond(500)
+
+    def initiate_send(self):
+        obs = self.ac_out_buffer_size
+       
+        close = False
+        current = self.pipeline[0].response if self.pipeline else None
+        
+        while self.connected and len(self.write_data) < obs and getattr(response, 'sent', True) == False:
+
+            try:
+                n = response.next(self)
+            except StopIteration:
+                self.pipeline.pop(0)
+                break
+
+            if n == Wait:
+                break
+            elif n == Close:
+                close = True
+                break
+            else:
+                self.write_data += n                 
+
+        if not self.write_data:
+            return
+
+        try:
+            sent = self.send(self.write_data)
+            self.write_data = self.write_data[max(sent,0):]                    
+        except socket.error:
+            self.handle_error()
+            return
+        
+        if close:
+            self.handle_close()
+
+    def writable(self):
+        return self.write_data \
+            or (self.pipeline and getattr(self.pipeline[0].response, 'sent', True) == False)
+
     def handle_close(self):
         if hasattr(self, '_idle_handle'):
-            u = self.server if self.client else self.server.upnpy
-            u.remove_idle(self._idle_handle)
-        asynchat.async_chat.handle_close(self)
+            upnpy = self.server.upnpy
+            upnpy.remove_idle(self._idle_handle)
+        _HTTPConnection.handle_close(self)
 
 class _IdleHandler(object):
     def __init__(self, upnpy, connection):
@@ -665,7 +707,10 @@ class ConnectionManager(object):
 
         request = self.create_request(url, command,
                             headers=headers, body=body)
-        request.callback = callback
+
+        if callback:
+            request.callback = callback
+
         self.send(request)
 
     def create_request(self, url, command, headers=None, body=None):
@@ -673,14 +718,16 @@ class ConnectionManager(object):
         up = urlparse.urlparse(url)
 
         if up.scheme == 'http':
-            addr = (up.hostname, up.port or 80, HTTPConnection)
+            addr = (up.hostname, up.port or 80, HTTPClientConnection)
         
         elif up.scheme == 'https':
-            from ussl import SSLHTTPConnection
-            addr = (up.hostname, up.port or 443, SSLHTTPConnection)
+            from ussl import SSLHTTPClientConnection
+            addr = (up.hostname, up.port or 443, SSLHTTPClientConnection)
                     
-        request = addr[2].REQUEST_CLASS(command=command, path=urlparse.urlunparse((None, None)+up[2:]),
-                                                        headers=headers, body=body)
+        request = addr[2].REQUEST_CLASS(command=command,
+                                        path=urlparse.urlunparse((None, None)+up[2:]),
+                                        headers=Headers(Host=up.netloc, **(headers or {})),
+                                        body=body)
         request._addr = addr
 
         return request
@@ -700,7 +747,7 @@ class ConnectionManager(object):
         if addr in self.connections:
             conn = self.connections[addr].reconnect()
         else:
-            conn = cls(self.upnpy, None, netloc, client=True)
+            conn = cls(self.upnpy, None, netloc)
             conn.create_socket()
             conn.connect(addr[:2])
 
@@ -739,6 +786,8 @@ class ConnectionManager(object):
         if not request.callback:
             start = time.time()
             self.upnp.serve_while(lambda:time.time()<start+10.0 and not conn.response)
+
+            self.send_next(addr)
 
             if not conn.response:
                 return conn.RESPONSE_CLASS(0, "Timeout")

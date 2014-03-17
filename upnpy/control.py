@@ -394,6 +394,7 @@ class Subscription(object):
     
     def __init__(self, service):
         self.service = service
+        self.conm = self.service._parents[0]._conm
         self.sid = None
         self.alarm = None
         self.upnpy = service._upnpy
@@ -408,7 +409,8 @@ class Subscription(object):
 
         headers = dict(TIMEOUT='Second-%d'%self.service.EXPIRY)
 
-        request = self.service._parents[0]._conm.create_request(self.service._absurl(self.service.eventSubURL, True), command, headers, body)
+        request = self.conm.create_request(self.service._absurl(self.service.eventSubURL),
+                                                                'SUBSCRIBE', headers=headers)
         request.callback = self._subscribed
 
         if self.sid:
@@ -421,7 +423,7 @@ class Subscription(object):
                      self.upnpy._http.server_port)
             request.on_connect = on_connect
 
-        self._parents[0]._conm.send(request)
+        self.conm.send(request)
 
     def _subscribed(self, response):
         if response.code != '200':

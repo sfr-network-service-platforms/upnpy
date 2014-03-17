@@ -325,7 +325,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         #                 ST=type))
 
     def send_request(self, to, command, path, headers=None, body=None):
-        conn = SSDPConnection(self, to, client=True)
+        conn = SSDPClientConnection(self, to)
         request = conn.REQUEST_CLASS(
             command=command,
             path=path,
@@ -340,7 +340,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         data, addr = self.recv(4096)
         if data:
             try:
-                SSDPConnection(self, addr, data)
+                SSDPServerConnection(self, addr, data)
             except Exception, e:
                 from asyncore import compact_traceback
                 nil, t, v, tbinfo = compact_traceback()
@@ -405,18 +405,10 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             self.server.upnpy._https.server_port if secure else self.server.upnpy._http.server_port,
             path)
 
-class SSDPConnection(http.HTTPConnection):
+class _SSDPConnection(http._HTTPConnection):
     
     REQUEST_CLASS = SSDPRequest
     RESPONSE_CLASS = SSDPResponse
-
-    def __init__(self, server, remote_address, data=None, client=False):
-        self._incomming = data
-        http.HTTPConnection.__init__(self, server, None, remote_address, client=client)
-        self.connected = True
-
-        if data:
-            self.handle_read()
 
     def set_idle_handler(self):
         pass
@@ -428,10 +420,10 @@ class SSDPConnection(http.HTTPConnection):
         return self.server.socket.getsockname()
 
     def send(self, data):
-        return self.server.send(data, self.remote_address)
-        
+        return self.server.send(data, self.remote_address)       
 
     def add_channel(self, sock, map=None):
+        #socket already in map
         pass
 
     def close(self):
@@ -439,3 +431,19 @@ class SSDPConnection(http.HTTPConnection):
         self.accepting = False
         self.connecting = False
         #do not close socket
+
+class SSDPClientConnection(_SSDPConnection, http.HTTPClientConnection):
+
+    def __init__(self, server, remote_address):
+        http.HTTPClientConnection.__init__(self, server, None, remote_address)
+        self.connected = True
+
+class SSDPServerConnection(_SSDPConnection, http.HTTPServerConnection):
+
+    def __init__(self, server, remote_address, data):
+        self._incomming = data
+        http.HTTPServerConnection.__init__(self, server, None, remote_address)
+        self.connected = True
+
+        #handle incomming data
+        self.handle_read()
