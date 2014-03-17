@@ -8,7 +8,7 @@ __license__ = 'GNU LESSER GENERAL PUBLIC LICENSE Version 2.1'
 import shelve, os, fcntl, contextlib
 
 PATH = os.path.expanduser('~/.cache/upnpy')
-lock = file(PATH+'.lock', 'r+')
+lock = file(PATH+'.lock', 'w+')
 
 @contextlib.contextmanager
 def DB(write=True):
