@@ -40,11 +40,14 @@ if sslpackage == 'm2crypto':
             HTTPConnection.create_socket(self)
             self.socket = ssl_connection(self.socket, 'control')
 
-        def reuse_session(self, conn):
+        def reconnect(self):
+            conn = self.__class__(self.server, None, self.remote_address, client=self.client)
             try:
-                self.socket.set_session(conn.socket.get_session())        
+                conn.socket.set_session(self.socket.get_session())        
             except AssertionError:
                 pass                
+            conn.create_socket(self.remote_address)
+            return conn
 
         def connect(self, address):
             self.connected = False
@@ -88,14 +91,15 @@ if sslpackage == 'm2crypto':
                     self.ssl_handshake_pending = True
 
         def do_ssl_shutdown(self):
+            old = self.socket.get_shutdown()
             self.socket.close()
-            self.logger.info('do_ssl_shutdown : %d' % self.socket.get_shutdown())
-            if self.socket.get_shutdown() == m2.SSL_SENT_SHUTDOWN | m2.SSL_RECEIVED_SHUTDOWN:
+            if self.socket.get_shutdown() == m2.SSL_SENT_SHUTDOWN | m2.SSL_RECEIVED_SHUTDOWN or self.socket.get_shutdown() == old:
                 self.ssl_shutdown_pending = False
                 self.connected = False
                 self.close()
                         
         def handle_read_event(self):
+            self.logger.info('handle_read_event %s %s %s %s', self.ssl_handshake_pending, self.ssl_shutdown_pending, self.connected, self.connecting)
             try:
                 if self.ssl_handshake_pending:
                     self.do_ssl_handshake()
@@ -104,11 +108,12 @@ if sslpackage == 'm2crypto':
                 else:
                     HTTPConnection.handle_read_event(self)
             except SSL.SSLError, e:
-                self.logger.error(e)
+                self.logger.error("handle_read_event : %s", e)
                 self.socket.clear()
-                self.close()
+                self.handle_error()
 
         def handle_write_event(self):
+            self.logger.info('handle_write_event %s %s %s %s', self.ssl_handshake_pending, self.ssl_shutdown_pending, self.connected, self.connecting)
             try:
                 if self.ssl_handshake_pending:
                     self.do_ssl_handshake()
@@ -117,14 +122,20 @@ if sslpackage == 'm2crypto':
                 else:
                     HTTPConnection.handle_write_event(self)
             except SSL.SSLError, e:
-                self.logger.error(e)
+                self.logger.error("handle_write_event : %s", e)
                 self.socket.clear()
-                self.close()
+                self.handle_error()
 
         def handle_close(self):
+            self.logger.info("handle_close %s %s", self.connected, self.ssl_shutdown_pending)
+            if hasattr(self, '_idle_handle'):
+                u = self.server if self.client else self.server.upnpy
+                u.remove_idle(self._idle_handle)
             if self.connected == True and not self.ssl_shutdown_pending:
                 self.ssl_shutdown_pending = True 
                 self.do_ssl_shutdown()
+            else:
+                self.logger.warning("handle_close already required ...")
 
     def ssl_connection(socket, type=None):
 
@@ -256,12 +267,6 @@ elif sslpackage == 'openssl':
         def create_socket(self):
             HTTPConnection.create_socket(self)
             self.socket = ssl_connection(self.socket, 'control')
-
-        def reuse_session(self, conn):
-            try:
-                self.socket.set_session(conn.socket.get_session())        
-            except AssertionError:
-                pass                
 
         def do_ssl_handshake(self):
             try:

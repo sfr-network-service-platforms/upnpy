@@ -38,10 +38,9 @@ class UPnPObject(object):
     def _byebye(self):
         self._parents[0]._clean()
 
-    def _request(self, url, command, callback, headers=None, body=None, on_connect=None):
+    def _request(self, url, command, callback, headers=None, body=None):
 
-
-        self._parents[0]._conm.send_request(url, command, callback, headers, body, on_connect=on_connect)
+        self._parents[0]._conm.send_request(url, command, callback, headers, body)
 
     def _describe(self, location, cb):
         if location in self._DESCRIPTIONS:
@@ -408,17 +407,21 @@ class Subscription(object):
             self.upnpy._http = HTTPServer(self.upnpy)
 
         headers = dict(TIMEOUT='Second-%d'%self.service.EXPIRY)
+
+        request = self.service._parents[0]._conm.create_request(self.service._absurl(self.service.eventSubURL, True), command, headers, body)
+        request.callback = self._subscribed
+
         if self.sid:
             headers['SID'] = self.sid
-            on_connect=None
         else:
             headers['NT'] = 'upnp:event'
             def on_connect(conn):
                 headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
                     (conn.getsockname()[0],
                      self.upnpy._http.server_port)
-                    
-        self.service._request(self.service._absurl(self.service.eventSubURL), 'SUBSCRIBE', self._subscribed, headers, on_connect=on_connect)
+            request.on_connect = on_connect
+
+        self._parents[0]._conm.send(request)
 
     def _subscribed(self, response):
         if response.code != '200':

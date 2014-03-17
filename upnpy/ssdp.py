@@ -45,7 +45,7 @@ class SSDPServer(object):
 
         self._emit_server = SSDPSingleServer(self, '0.0.0.0', 0)
                            
-    def msearch(self, type, mx=1.0):
+    def msearch(self, type, mx=5.0):
         self._emit_server.msearch(type, mx)
 
     def advertise(self, devser):
@@ -175,7 +175,7 @@ class SSDPServer(object):
             self.byebye(usn)
         self._handlers = []
 
-class SSDPMessage(http.HTTPMessage):
+class SSDPRequest(http.HTTPRequest):
 
     def parse_requestline(self):
         
@@ -189,44 +189,18 @@ class SSDPMessage(http.HTTPMessage):
             self.request_version, self.command, self.status = rl
         else:
             return self.send_error(400, "Bad request syntax (%r)" % self.firstline)
-    parse_responseline = parse_requestline
 
-    def send_response(self, code, message=None, headers=None, body=None):
-        self.send_responseline(code, message)
-        headers = http.Headers(dict(
-                SERVER=self.version_string()),
-                          **(headers or {}))
-        headers, body = self.adjust_content(headers, body)
-        self.send_headers(headers, body)
-        if self.command != 'HEAD' and code >= 200 and code not in (204, 304):
-            self.send_body(body)
+    def adjust_headers(self):
+        self.headers.set_if_unset('User-Agent', self.version_string())
 
-    def send_error(self, code, message=None):
-        """Send and log an error reply.
+    def respond(self, *args, **kwargs):
+        http.HTTPRequest.respond(self, *args, **kwargs)
+        self.response = None #allow multiple responses for a single request
 
-        Arguments are the error code, and a detailed message.
-        The detailed message defaults to the short entry matching the
-        response code.
+class SSDPResponse(http.HTTPResponse):
 
-        This sends an error response (so it must be called before any
-        output has been generated), logs the error, and finally sends
-        a piece of HTML explaining the error to the user.
-
-        """
-
-        try:
-            short, long = self.responses[code]
-        except KeyError:
-            short, long = '???', '???'
-        if message is None:
-            message = short
-        explain = long
-        self.logger.info('error %d handling request %s (%r, %s)', code, self.firstline, self.headers, self.body[:500] if self.body else None)
-        self.log_error("code %d, message %s", code, message)
-
-    def push(self):
-        self.connection.initiate_send()
-
+    def adjust_headers(self):
+        self.headers.set_if_unset('SERVER', self.version_string())
 
 import collections
 SSDPEntry = collections.namedtuple('SSDPEntry', 'usn type location seclocation, expiry, devices')
@@ -267,8 +241,8 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         method = getattr(self, 'do_'+request.command.replace('-', '_'), None)
         if callable(method):
             method(request)
-        #else:
-        #    self.log_error("unhandled method %s", request.command)
+        else:
+            self.logger.error("unhandled method %s", request.command)
             
     def do_M_SEARCH(self, request):
         if self.address == '': return
@@ -288,7 +262,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
                         'EXT': ''}
                 if a.seclocation:
                     headers['SECURELOCATION.UPNP.ORG'] = self._url(a.seclocation, True)
-                request.send_response(200, headers=headers)
+                request.respond(200, headers=headers)
 
     def do_NOTIFY(self, request):
         activity = request.headers.get('NTS',':').split(':')[1]
@@ -309,7 +283,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         elif activity == 'byebye':
             self.server.byebye(usn)
         else:
-            self.log_error("NOTIFY : unhandled NTS %s", activity)        
+            self.logger.error("NOTIFY : unhandled NTS %s", activity)
 
     def do_200(self, request):
         expiry = time.time()
@@ -350,18 +324,18 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         #                 MX=int(mx),
         #                 ST=type))
 
-    def send_request(self, to, command, path, headers=None, body=None):        
-        request = SSDPConnection(self, to, client=True).create_message()
+    def send_request(self, to, command, path, headers=None, body=None):
+        conn = SSDPConnection(self, to, client=True)
+        request = conn.REQUEST_CLASS(
+            command=command,
+            path=path,
+            headers=http.Headers({
+                    'HOST':'%s:%d' % to},
+                                 **(headers or {})),
+            body=body,
+            )
+        conn.send_request(request)         
 
-        request.send_requestline(command, path)
-        headers = http.Headers({
-                'User-Agent':request.version_string(),
-                'HOST':'%s:%d' % to},
-                          **(headers or {}))
-        headers, body = request.adjust_content(headers, body)
-        request.send_headers(headers, body)
-        request.send_body(body)
- 
     def handle_read(self):
         data, addr = self.recv(4096)
         if data:
@@ -432,8 +406,9 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             path)
 
 class SSDPConnection(http.HTTPConnection):
-
-    MESSAGE_CLASS = SSDPMessage
+    
+    REQUEST_CLASS = SSDPRequest
+    RESPONSE_CLASS = SSDPResponse
 
     def __init__(self, server, remote_address, data=None, client=False):
         self._incomming = data
