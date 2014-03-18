@@ -312,6 +312,7 @@ class HTTPRequest(_HTTPMessage):
 
         self.callback = None
         self.response = None
+        self._retries = 0
 
         _HTTPMessage.__init__(self, *args, **kwargs)
 
@@ -359,7 +360,7 @@ class HTTPRequest(_HTTPMessage):
         #self.connection.initiate_send()
 
         return False
-
+    
     def handle_response(self, response):
         self.response = response
         if callable(self.callback):
@@ -379,6 +380,13 @@ class HTTPResponse(_HTTPMessage):
             raise ValueError("neither firstline nor code set!")
 
         self.response = None
+
+    @classmethod
+    def from_exception(cls, exception):
+        if isinstance(exception, socket.error):
+            return cls(-exception.args[0], exception.args[1])
+        else:
+            return cls(0, str(exception))        
 
     def parse_responseline(self):
 
@@ -614,7 +622,15 @@ class HTTPClientConnection(_HTTPConnection):
             upnpy = self.server
             upnpy.remove_idle(self._idle_handle)
         while self.pipeline:
-            self.pipeline.pop().handle_response(self.RESPONSE_CLASS(0, status="connection closed"))
+            self.pipeline.pop().handle_response(self.RESPONSE_CLASS(0, 'connection closed'))
+
+    # def handle_error():
+    #     import sys
+    #     ex = sys.exc_info()[1]
+    #     logging.error("from_exception : %s", ex)
+    #     while self.pipeline:
+    #         self.pipeline.pop().handle_response(self.RESPONSE_CLASS.from_exception(ex))
+    #     _HTTPConnection.handle_error(self)
 
 class HTTPServerConnection(_HTTPConnection):
 
@@ -772,14 +788,22 @@ class ConnectionManager(object):
         if conn.pipeline and not conn.pipelining:
             return
 
+        #filter non idempotent method for pipelining
         if request.command not in ('GET', 'DELETE', 'PUSH', 'HEAD', 'NOTIFY', 'SUBSCRIBE') and conn.pipeline:
             return
 
         self.pending[addr].pop(0)
 
         def cb(response):
-            self.send_next(addr)
-            request._callback(response)
+            if response.code == 0 and request._retries < 3:
+                request.response = None
+                request._generator = None
+                request._retries += 1
+                self.send(request)
+            else:
+                self.send_next(addr)
+                request._callback(response)
+
         request._callback, request.callback = request.callback, cb
 
         #logging.error("conn send_request %s %s %s %r %r", conn, url, command, callback, headers)

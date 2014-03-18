@@ -398,6 +398,9 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             else:
                 raise
 
+    def handle_close():
+        pass
+
     def _url(self, path, secure=False):
         return 'http%s://%s:%d%s' % (
             's' if secure else '',
