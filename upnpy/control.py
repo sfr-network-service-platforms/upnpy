@@ -132,10 +132,22 @@ class Service(UPnPObject):
 
     def _do_action(self, action, _cb, args):
 
-        self._request(self._absurl(self.controlURL), 'POST', lambda r:self._result(action, r, _cb),
-                      headers = {'Content-Type': 'text/xml; charset="utf-8"',
-                       'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
-                      body=self._soapQuery(action, args))
+        conm = self._parents[0]._conm
+
+        request = conm.create_request(self._absurl(self.controlURL), 'POST',
+                                      headers = {'Content-Type': 'text/xml; charset="utf-8"',
+                                                 'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
+                                      body=self._soapQuery(action, args))
+        request.callback = lambda response:self._result(action, response, _cb) if _cb else None
+
+        conm.send(request)
+
+        if not _cb:
+            import time
+            start = time.time()
+            self._upnpy.serve_while(lambda:time.time()<start+10.0 and not request.response)
+            
+            return self._result(action, request.response, None)
 
     def _result(self, action, response, cb):
         self._logger.debug(response.body)
@@ -143,7 +155,7 @@ class Service(UPnPObject):
         if cb:
             cb(**ret)
         else:
-            self._logger.info("%s result : %r", action, ret)
+            return ret
 
     def _subscribe(self):
 
@@ -311,10 +323,11 @@ def %s(%s):
     """Method %s.%s
 params:
   %s
+  _cb : optionnal callback
 returns:
   %s
 """
-    self.do_action({%s}, _cb=_cb)
+    return self.do_action({%s}, _cb=_cb)
         ''' % (
             utils.normalize(self.name),
             ", ".join(["%s=None" % p.identifier for p in params]+['_cb=None']),

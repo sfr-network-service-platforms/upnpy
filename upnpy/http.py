@@ -704,14 +704,13 @@ class ConnectionManager(object):
         self.connections = dict()
         self.pending = dict()
 
-    def send_request(self, url, command, callback=None, headers=None, body=None):
+    def send_request(self, url, command, callback, headers=None, body=None):
         #logging.error("send_request %s %s %r %r", url, command, callback, headers)
 
         request = self.create_request(url, command,
                             headers=headers, body=body)
 
-        if callback:
-            request.callback = callback
+        request.callback = callback
 
         self.send(request)
 
@@ -778,24 +777,14 @@ class ConnectionManager(object):
 
         self.pending[addr].pop(0)
 
-        if request.callback:
-            def cb(response):
-                self.send_next(addr)
-                request._callback(response)
-            request._callback, request.callback = request.callback, cb
+        def cb(response):
+            self.send_next(addr)
+            request._callback(response)
+        request._callback, request.callback = request.callback, cb
 
         #logging.error("conn send_request %s %s %s %r %r", conn, url, command, callback, headers)
         conn.send_request(request)
        
-        if not request.callback:
-            start = time.time()
-            self.upnp.serve_while(lambda:time.time()<start+10.0 and not conn.response)
-
-            self.send_next(addr)
-
-            if not conn.response:
-                return conn.RESPONSE_CLASS(0, "Timeout")
-
     def clean(self):
         for n, c in self.connections.items():
             c.handle_close()
