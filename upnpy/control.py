@@ -408,18 +408,19 @@ class Subscription(object):
             self.upnpy._http = HTTPServer(self.upnpy)
 
         headers = dict(TIMEOUT='Second-%d'%self.service.EXPIRY)
+        if self.sid:
+            headers['SID'] = self.sid
+        else:
+            headers['NT'] = 'upnp:event'
 
         request = self.conm.create_request(self.service._absurl(self.service.eventSubURL),
                                                                 'SUBSCRIBE', headers=headers)
         request.callback = self._subscribed
 
-        if self.sid:
-            headers['SID'] = self.sid
-        else:
-            headers['NT'] = 'upnp:event'
-            def on_connect(conn):
-                headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
-                    (conn.getsockname()[0],
+        if not self.sid:
+            def on_connect(request):
+                request.headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
+                    (request.connection.getsockname()[0],
                      self.upnpy._http.server_port)
             request.on_connect = on_connect
 

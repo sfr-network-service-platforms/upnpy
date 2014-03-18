@@ -179,16 +179,16 @@ class SSDPRequest(http.HTTPRequest):
 
     def parse_requestline(self):
         
-        rl = self.firstline.split() 
+        rl = self.firstline.split(None, 2) 
         if len(rl) != 3:
-            return self.send_error(400, "Bad request syntax (%r)" % self.firstline)
+            return self.respond(400, "Bad request syntax (%r)" % self.firstline)
 
         if rl[2].startswith('HTTP/'):
             self.command, self.path, self.request_version = rl
         elif rl[0].startswith('HTTP/'):
             self.request_version, self.command, self.status = rl
         else:
-            return self.send_error(400, "Bad request syntax (%r)" % self.firstline)
+            return self.respond(400, "Bad request syntax (%r)" % self.firstline)
 
     def adjust_headers(self):
         self.headers.set_if_unset('User-Agent', self.version_string())

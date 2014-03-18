@@ -6,17 +6,12 @@ __copyright__ = 'Copyright (c) 2014 SFR (http://www.sfr.com)'
 __license__ = 'GNU LESSER GENERAL PUBLIC LICENSE Version 2.1'
 
 import asyncore, asynchat
-import os, socket, string
+import os, socket
 import logging
 import time
 import urlparse
 
-try:
-    import cStringIO as StringIO
-except:
-    import StringIO as StringIO
-
-class LoggedDispatcher():
+class LoggedDispatcher(object):
     def __init__(self, name=None):
         name = name or self.__class__.__name__
         self.logger = logging.getLogger(name)
@@ -56,7 +51,11 @@ class HTTPServer(LoggedDispatcher, asyncore.dispatcher):
         self.listen(5)
 
     def handle_accept(self):
-        conn_addr = self.accept()
+        try:
+            conn_addr = self.accept()
+        except Exception, e:
+            self.logger.warning("handle_accept : %s", e)
+            return
         if not conn_addr: return
 
         if self.ssl:
@@ -64,7 +63,7 @@ class HTTPServer(LoggedDispatcher, asyncore.dispatcher):
             SSLHTTPServerConnection(self, *conn_addr)
         else:
             HTTPServerConnection(self, *conn_addr)
-
+        
     def handle_request(self, request):
 
         up = urlparse.urlparse(request.path)
@@ -115,7 +114,6 @@ class _HTTPMessage(object):
         self.access_logger = logging.getLogger('http.access')
 
         self.connection = None
-        self.on_connect = None
 
         self.http_version = http_version or "HTTP/1.1"
 
@@ -126,12 +124,14 @@ class _HTTPMessage(object):
         self._discard_body = False
         self.sent = False
 
+        self.on_connect = None
+
     def next(self, connection):
         if not hasattr(self, '_generator'):
             self._generator = iter(self)
             self.connection = connection
             if callable(self.on_connect):
-                self.on_connect(connection)
+                self.on_connect(self)
 
         return next(self._generator)
 
@@ -154,8 +154,8 @@ class _HTTPMessage(object):
                 except StopIteration:
                     break
 
-    # def send_response(self, code, message=None, headers=None, body=None):
-    #     self.send_responseline(code, message)
+    # def send_response(self, code, status=None, headers=None, body=None):
+    #     self.send_responseline(code, status)
     #     headers = Headers(dict(
     #            Server=self.version_string(),
     #            Date=self.date_time_string(),
@@ -168,17 +168,17 @@ class _HTTPMessage(object):
     #     if headers.get('Connection', 'close').lower() != 'keep-alive':
     #         self.connection.close_when_done()
 
-    # def send_responseline(self, code, message=None):
+    # def send_responseline(self, code, status=None):
     #     self.log_request(code)
-    #     if message is None:
+    #     if status is None:
     #         if code in self.responses:
-    #             message = self.responses[code][0]
+    #             status = self.responses[code][0]
     #         else:
-    #             message = ''
+    #             status = ''
     #     if self.http_version != 'HTTP/0.9':
     #         self.send("%s %d %s\r\n" %
-    #                   (self.http_version, code, message))
-    #         # print (self.protocol_version, code, message)
+    #                   (self.http_version, code, status))
+    #         # print (self.protocol_version, code, status)
 
     # def send_requestline(self, command, path, http_version=None):
     #     """Send the response header and log the response code.
@@ -310,6 +310,9 @@ class HTTPRequest(_HTTPMessage):
 
     def __init__(self, command=None, path=None, *args, **kwargs):
 
+        self.callback = None
+        self.response = None
+
         _HTTPMessage.__init__(self, *args, **kwargs)
 
         if command and path:
@@ -320,9 +323,6 @@ class HTTPRequest(_HTTPMessage):
             self.parse_requestline()
         else:
             raise ValueError("neither firstline nor (command,path) set!")
-
-        self.callback = None
-        self.response = None
 
     def parse_requestline(self):
 
@@ -339,20 +339,15 @@ class HTTPRequest(_HTTPMessage):
         self.command, self.path = rl[0:2]
 
     def adjust_headers(self):
-        if callable(self.on_connect):
-            self.on_connect(self.connection)
-
         self.headers.set_if_unset('User-Agent', self.version_string())
         self.headers.set_if_unset('Connection', 'Keep-Alive')
 
-    def respond(self, code, message=None, headers=None, body=None):
+    def respond(self, code, status=None, headers=None, body=None):
 
         if self.response:
             raise Exception('response already set!')
         
-        self.log_request(code)
-
-        self.response = HTTPResponse(code=code, message=message, http_version=self.http_version,
+        self.response = HTTPResponse(code=code, status=status, http_version=self.http_version,
                             headers = Headers(headers,
                                               Connection=self.headers.get('Connection', 'Keep-Alive')),
                             body = body)
@@ -363,23 +358,25 @@ class HTTPRequest(_HTTPMessage):
         self.connection.handle_write_event()
         #self.connection.initiate_send()
 
-    def handle_response(self, message):
+        return False
+
+    def handle_response(self, response):
         self.response = response
         if callable(self.callback):
             self.callback(response)
 
 class HTTPResponse(_HTTPMessage):
 
-    def __init__(self, code=None, message=None, *args, **kwargs):
+    def __init__(self, code=None, status=None, *args, **kwargs):
         _HTTPMessage.__init__(self, *args, **kwargs)
-        if code:
+        if code is not None:
             self.code = code
-            self.message = message or self.RESPONSES.get(code, '???')[0]
-            self.firstline = "%s %s %s"  % (self.http_version, code, self.message)
+            self.status = status or self.RESPONSES.get(code, '???')[0]
+            self.firstline = "%s %s %s"  % (self.http_version, code, self.status)
         elif self.firstline:
             self.parse_responseline()
         else:
-            raise ValueError("neither firstline nor (command,path) set!")
+            raise ValueError("neither firstline nor code set!")
 
         self.response = None
 
@@ -394,6 +391,11 @@ class HTTPResponse(_HTTPMessage):
             raise Exception("invalid response code '%s'" % self.rl[1])
                     
         self.http_version, self.code, self.status = rl            
+
+    def next(self, connection):
+        ret = _HTTPMessage.next(self, connection)        
+        self.log_request(self.code)
+        return ret
 
     def adjust_headers(self):
         self.headers.set_if_unset('Server', self.version_string())
@@ -425,8 +427,6 @@ class _HTTPConnection(LoggedDispatcher,asynchat.async_chat):
         self.read_data = ""
         self.write_data = ""
 
-        self.shutdown = 0
-
         self.keep_alive = self.KEEP_ALIVE
         self.last_activity = time.time()
         self.set_idle_handler()
@@ -439,25 +439,14 @@ class _HTTPConnection(LoggedDispatcher,asynchat.async_chat):
     def create_socket(self):
         asynchat.async_chat.create_socket(self, socket.AF_INET, socket.SOCK_STREAM)
 
-    def reconnect(self):
-        conn = self.__class__(self.server, None, self.remote_address)
-        conn.create_socket()
-        return conn
-
-    def send_request(self, request):
-        self.pipeline.append(request)
-        self.logger.info('send_request %s on %s', request, self)
-        self.handle_write_event()
-        #self.initiate_send()
-
     def collect_incoming_data(self, data):
         self.read_data = self.read_data + data
 
     def set_next_handler(self, handler, terminator = None):
         
         #if self.__class__.__name__ == 'SSLHTTPConnection':
-        #    self.logger.info("set_next_handler '%s' '%s'", self.found_terminator, self.read_data)
-
+        #self.logger.debug("set_next_handler '%s' '%s'", self.found_terminator, self.read_data)
+        
         self.read_data = ""
         self.found_terminator = handler
         self.set_terminator(terminator or handler.terminator)
@@ -550,20 +539,33 @@ class HTTPClientConnection(_HTTPConnection):
         upnpy = self.server
         self._idle_handle = upnpy.set_idle(_IdleHandler(upnpy, self))
 
-    def handle_message(self):        
-        message = self.message
-        del self.message
+    def reconnect(self):
+        conn = self.__class__(self.server, None, self.remote_address)
+        conn.create_socket()
+        return conn
 
-        self.set_next_handler(self.found_response)
+    def send_request(self, request):
+        self.pipeline.append(request)
+        #self.logger.info('send_request %s on %s (%s)', request, self, self.pipeline)
+        #self.handle_write_event()
+        self.initiate_send()
+    
+    def handle_message(self):
+        response = self.message
+        self.message = None
 
-        if message.headers.get('Connection', 'close').lower() != 'keep-alive':
+        #self.logger.info('receive response %s on %s', response, self)
+        request = self.pipeline.pop(0)
+
+        if response.headers.get('Connection',
+                                "close" if response.http_version is "HTTP/1.0" else "keep-alive")\
+                           .lower() == 'close':
             self.handle_close()
         else:
+            self.set_next_handler(self.found_response)
             self.pipelining = True
 
-        self.logger.info('receive response %s on %s', message, self)
-        req = self.pipeline.pop(0)
-        req.handle_response(message)
+        request.handle_response(response)
 
     def initiate_send(self):
         obs = self.ac_out_buffer_size
@@ -612,7 +614,7 @@ class HTTPClientConnection(_HTTPConnection):
             upnpy = self.server
             upnpy.remove_idle(self._idle_handle)
         while self.pipeline:
-            self.pipeline.pop().handle_response(self.RESPONSE_CLASS(code=0, message="connection closed"))
+            self.pipeline.pop().handle_response(self.RESPONSE_CLASS(0, status="connection closed"))
 
 class HTTPServerConnection(_HTTPConnection):
 
@@ -627,7 +629,7 @@ class HTTPServerConnection(_HTTPConnection):
 
     def handle_message(self):        
         message = self.message
-        del self.message
+        self.message = None
 
         self.set_next_handler(self.found_request)
 
@@ -641,7 +643,7 @@ class HTTPServerConnection(_HTTPConnection):
         obs = self.ac_out_buffer_size
        
         close = False
-        current = self.pipeline[0].response if self.pipeline else None
+        response = self.pipeline[0].response if self.pipeline else None
         
         while self.connected and len(self.write_data) < obs and getattr(response, 'sent', True) == False:
 
@@ -749,25 +751,27 @@ class ConnectionManager(object):
         else:
             conn = cls(self.upnpy, None, netloc)
             conn.create_socket()
-            conn.connect(addr[:2])
+        conn.connect(addr[:2])
 
         self.connections[addr] = conn
 
     def send_next(self, addr):
-
-        if not addr in self.connections \
-                or (not self.connections[addr].connected \
-                        and not self.connections[addr].connecting):
-            logging.debug('reconnect %r %r', addr, self.connections.get(addr, None))
-            pipeline = False
-            self.reconnect(addr)
-        conn = self.connections[addr]
-        if conn.pipeline and not conn.pipelining:
-            return
+        #import traceback
+        #logging.exception('send_next %s %s', addr, "".join(traceback.format_stack()))
 
         if not self.pending[addr]:
             return
         request = self.pending[addr][0]
+
+        if not addr in self.connections \
+                or (not self.connections[addr].connected \
+                        and not self.connections[addr].connecting):
+            #logging.info('reconnect %r %r', addr, self.connections.get(addr, None))
+            self.reconnect(addr)
+
+        conn = self.connections[addr]
+        if conn.pipeline and not conn.pipelining:
+            return
 
         if request.command not in ('GET', 'DELETE', 'PUSH', 'HEAD', 'NOTIFY', 'SUBSCRIBE') and conn.pipeline:
             return

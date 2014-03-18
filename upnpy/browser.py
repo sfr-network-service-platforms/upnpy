@@ -175,7 +175,7 @@ class MyURWIDRepl(bpython.URWIDRepl):
         self.devices = urwid.ListBox(urwid.SimpleListWalker([urwid.Text('Devices:')]))
         self.logs = urwid.ListBox(urwid.SimpleListWalker([]))
 
-        self.frame.set_footer(urwid.BoxAdapter(self.logs, 35))
+        self.frame.set_footer(urwid.BoxAdapter(self.logs, 25))
 
         self.main_frame = urwid.Columns([
                 self.frame,
