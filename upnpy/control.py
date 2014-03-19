@@ -202,7 +202,9 @@ class Service(UPnPObject):
             if v is not None:
                 e.text=str(v)
             
-        return utils.tostring(env, encoding='utf-8', default_namespace=SQNS.ns, xml_declaration=True)
+        return utils.tostring(env, encoding='utf-8', xml_declaration=True)
+        #default_namespace=SQNS.ns)
+        #does not seem to behave correctly with some xml library (libupnp, ..)
 
     def _parseSoapResponse(self, action, response):
 
