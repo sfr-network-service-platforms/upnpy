@@ -226,8 +226,7 @@ class Service(UPnPObject):
             if fault is None:              
                 raise ActionError('No response found')
 
-            desc = fault.find(SQNS('detail/')+CNS('UPnPError/')+CNS('errorDescription')) \
-                or fault.find('detail/'+CNS('UPnPError/')+CNS('errorDescription'))
+            desc = fault.find('detail/'+CNS('UPnPError/')+CNS('errorDescription'))
             if desc is not None:
                 raise ActionError(desc.text)
 

@@ -308,8 +308,8 @@ class BaseService(BaseUPnPObject):
 
         fault = ElementTree.SubElement(ElementTree.SubElement(env,SQNS('Body')), SQNS('Fault'))
         fault.extend([
-                _TextElement(SQNS('faultCode'), 'Client'),
-                _TextElement(SQNS('faultString'), 'UPnPError'),
+                _TextElement('faultCode', 'Client'),
+                _TextElement('faultString', 'UPnPError'),
                 detail,
                 ])
   
