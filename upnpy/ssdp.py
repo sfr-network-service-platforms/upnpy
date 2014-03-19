@@ -398,7 +398,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             else:
                 raise
 
-    def handle_close():
+    def handle_close(self):
         pass
 
     def _url(self, path, secure=False):
@@ -416,9 +416,6 @@ class _SSDPConnection(http._HTTPConnection):
     def set_idle_handler(self):
         pass
     
-    def recv(self, buffer_size):
-        return self._incomming
-
     def getsockname(self):
         return self.server.socket.getsockname()
 
@@ -450,3 +447,18 @@ class SSDPServerConnection(_SSDPConnection, http.HTTPServerConnection):
 
         #handle incomming data
         self.handle_read()
+
+    def recv(self, buffer_size):
+        return self._incomming
+
+    def handle_message(self):        
+        #Subclass HTTPServerConnection.handle_message not to send a response on error
+        message = self.message
+        self.message = None
+
+        self.set_next_handler(self.found_request)
+
+        try:
+            self.server.handle_request(message)
+        except Exception, e:
+            self.logger.exception("handle_request failed")

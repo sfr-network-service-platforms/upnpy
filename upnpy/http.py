@@ -110,7 +110,8 @@ class _HTTPMessage(object):
 
     def __init__(self, firstline=None, headers=None, body=None, http_version=None, on_connect=None):
 
-        self.connection = None
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.access_logger = logging.getLogger("http.access")
 
         self.http_version = http_version or "HTTP/1.1"
 
@@ -118,19 +119,11 @@ class _HTTPMessage(object):
         self.headers = Headers(headers or {})
         self.body = body
 
+        self.connection = None
         self._generator = None
         self._discard_body = False
         self.sent = False
         self.on_connect = on_connect
-
-        self.set_logger()
-        self.access_logger = logging.getLogger('http.access')
-
-    def set_logger(self):
-        name = self.__class__.__name__
-        if self.firstline:
-            name += ".%s" % self.firstline
-        self.logger = logging.getLogger(name)
 
     def next(self, connection):
         if not self._generator:
@@ -333,8 +326,6 @@ class HTTPRequest(_HTTPMessage):
         else:
             raise ValueError("neither firstline nor (method,path) set!")
 
-        self.set_logger()
-
     def parse_requestline(self):
 
         rl = self.firstline.split() 
@@ -379,7 +370,6 @@ class HTTPRequest(_HTTPMessage):
             self.callback(response)
 
     def prepare_retry(self):
-        self.logger.warning('retrying failed request')
         self.sent = False
         self.response = None
         self._generator = None
@@ -397,8 +387,6 @@ class HTTPResponse(_HTTPMessage):
             self.parse_responseline()
         else:
             raise ValueError("neither firstline nor code set!")
-
-        self.set_logger()
 
     @classmethod
     def from_exception(cls, exception):
@@ -755,6 +743,7 @@ class ConnectionManager(object):
 
         def cb(response):
             if response.code <= 0 and request._retries < 3:
+                request.logger.warning('retry failed request on %s:%s%s', request._addr[0], request._addr[1], request.path)
                 request.prepare_retry()
                 self.pending[addr].insert(0, request)
                 self.send_next(addr)

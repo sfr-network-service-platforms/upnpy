@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 
 """igd client example"""
 
@@ -9,10 +10,10 @@ import sys
 sys.path += ['.']
 
 import upnpy
-WCDTYPE = 'urn:schemas-upnp-org:device:WANConnectionDevice:1'
+WCSTYPE = 'urn:schemas-upnp-org:service:WANIPConnection:1'
 
 def GetExternalIPAddress():    
-    return upnpy.Upnpy().get(WCDTYPE).WANIPConnection.GetExternalIPAddress()['NewExternalIPAddress']
+    return upnpy.Upnpy().get(WCSTYPE).GetExternalIPAddress()['NewExternalIPAddress']
 
 def test():
     print 'ExternalIPAddress:', GetExternalIPAddress()
