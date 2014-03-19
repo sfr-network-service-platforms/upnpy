@@ -448,8 +448,8 @@ class _HTTPConnection(LoggedDispatcher,asynchat.async_chat):
             self.handle_close()
 
     def create_socket(self):
-        family, socktype, proto, canonname, sockaddr = socket.getaddrinfo(
-            self.remote_address[0], self.remote_address[1], 0, 0, proto = self.PROTO)
+        family, socktype = socket.getaddrinfo(
+            self.remote_address[0], self.remote_address[1], 0, 0, self.PROTO)[0][:2]
         asynchat.async_chat.create_socket(self, family, socktype)
 
     def collect_incoming_data(self, data):
@@ -796,8 +796,7 @@ class ConnectionManager(object):
         if not addr in self.connections \
                 or (not self.connections[addr].connected \
                         and not self.connections[addr].connecting):
-            logging.info('reconnect %r %r', addr, self.connections.get(addr, None))
-            print 'reconnect %r %r' %( addr, self.connections.get(addr, None))
+            logging.debug('reconnect %r %r', addr, self.connections.get(addr, None))
             self.reconnect(addr)
 
         conn = self.connections[addr]

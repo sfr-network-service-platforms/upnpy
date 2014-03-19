@@ -19,6 +19,7 @@ class SSDPServer(object):
 
     PORT = 1900
     MIP = '239.255.255.250'
+    MIPv6 = '239.255.255.250'
 
     REPLIES = 3
 
@@ -41,7 +42,7 @@ class SSDPServer(object):
                 if i == 'lo': continue
                 self._iface_servers.append(SSDPSingleServer(self, a, self.PORT))
 
-            self._any_server = SSDPSingleServer(self, '', self.PORT)
+            self._any_server = SSDPSingleServer(self, '0.0.0.0', self.PORT)
 
         self._emit_server = SSDPSingleServer(self, '0.0.0.0', 0)
                            
@@ -213,6 +214,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
 
         self.server = server
         self.address = address
+        self.port = port
         self.interface = interface
 
         http.LoggedDispatcher.__init__(self)
@@ -224,25 +226,23 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         self.set_reuse_addr()
 
         if port:
-            #print "bind", (self.server.MIP if address else address, port)
-            self.bind((self.server.MIP if address else address, port))
+            #print "bind", (self.server.MIP if address != '0.0.0.0' else address, port)
+            self.bind((self.server.MIP if address != '0.0.0.0' else address, port))
         
-        if address != '':
+        if address != '0.0.0.0':
             self.join_multicast()
 
     def create_socket(self):
-        family, socktype, proto, canonname, sockaddr = socket.getaddrinfo(
-            self.address[0], self.address[1], 0, 0, self.PROTO)
-        asynchat.async_chat.create_socket(self, family, socktype)
+        family, socktype = socket.getaddrinfo(
+            self.address, self.port, 0, 0, self.PROTO)[0][:2]
+        asyncore.dispatcher_with_send.create_socket(self, family, socktype)
 
     def join_multicast(self):
-        #print "join_multicast", self.address
         self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
                                socket.inet_aton(self.server.MIP) + socket.inet_aton(self.address))
         self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
         self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                               socket.inet_aton(self.address))    
-            
+                               socket.inet_aton(self.address))            
 
     def handle_request(self, request):
         method = getattr(self, 'do_'+request.method.replace('-', '_'), None)
