@@ -207,6 +207,8 @@ SSDPEntry = collections.namedtuple('SSDPEntry', 'usn type location seclocation, 
 
 class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
 
+    PROTO = socket.SOL_UDP
+
     def __init__(self, server, address, port, interface=None):
 
         self.server = server
@@ -218,7 +220,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
 
         self.out_buffer = []
 
-        self.create_socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.create_socket()#socket.AF_INET, socket.SOCK_DGRAM)
         self.set_reuse_addr()
 
         if port:
@@ -227,6 +229,11 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         
         if address != '':
             self.join_multicast()
+
+    def create_socket(self):
+        family, socktype, proto, canonname, sockaddr = socket.getaddrinfo(
+            self.address[0], self.address[1], 0, 0, self.PROTO)
+        asynchat.async_chat.create_socket(self, family, socktype)
 
     def join_multicast(self):
         #print "join_multicast", self.address
