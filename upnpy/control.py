@@ -38,19 +38,19 @@ class UPnPObject(object):
     def _byebye(self):
         self._parents[0]._clean()
 
-    def _request(self, url, command, callback, headers=None, body=None):
+    def _request(self, url, method, callback, *args, **kwargs):
 
-        self._parents[0]._conm.send_request(url, command, callback, headers, body)
+        return self._upnpy.http_request(url, method, callback, *args, **kwargs)
 
-    def _describe(self, location, cb):
+    def _do_describe(self, location, cb):
         if location in self._DESCRIPTIONS:
             return cb(type('Response', (object,), dict(
                         body=self._DESCRIPTIONS[location],
                         code='200')))
 
-        self._request(location, 'GET', lambda resp: self._described(location, resp, cb))
+        self._request(location, 'GET', lambda resp: self._do_described(location, resp, cb))
 
-    def _described(self, location, response, cb):
+    def _do_described(self, location, response, cb):
 
         desc = response.body
 
@@ -99,7 +99,10 @@ class Service(UPnPObject):
         self._logger = logging.getLogger('service.%s:%s' % (self._parent.friendlyName, self._shortType))
 
         if self.SCPDURL:
-            self._describe(self._absurl(self.SCPDURL), self._parse)
+            self._describe()
+
+    def _describe(self):
+        self._do_describe(self._absurl(self.SCPDURL), self._parse)
             
     def _parse(self, response):
 
@@ -130,26 +133,17 @@ class Service(UPnPObject):
         if self.eventSubURL:
             self._subscribe()
 
-    def _do_action(self, action, _cb, args):
+    def _action(self, action, _cb, args):
 
-        conm = self._parents[0]._conm
-
-        request = conm.create_request(self._absurl(self.controlURL), 'POST',
-                                      headers = {'Content-Type': 'text/xml; charset="utf-8"',
-                                                 'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
-                                      body=self._soapQuery(action, args))
-        request.callback = lambda response:self._result(action, response, _cb) if _cb else None
-
-        conm.send(request)
-
+        ret = self._request(self._absurl(self.controlURL), 'POST',
+                            lambda response:self._result(action, response, _cb) if _cb else None,
+                            headers = {'Content-Type': 'text/xml; charset="utf-8"',
+                                       'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
+                            body=self._soapQuery(action, args))
         if not _cb:
-            import time
-            start = time.time()
-            self._upnpy.serve_while(lambda:time.time()<start+10.0 and not request.response)
-            
-            return self._result(action, request.response, None)
+            return self._action_result(action, ret, _cb)
 
-    def _result(self, action, response, cb):
+    def _action_result(self, action, response, cb):
         self._logger.debug(response.body)
         ret = self._parseSoapResponse(action, response)
         if cb:
@@ -169,8 +163,8 @@ class Service(UPnPObject):
             self._subscription.unsubscribe()
 
     def _notify(self, request):
-        if request.command != 'NOTIFY':
-            self._logger.warning('invalid command on notification path : %s', request.command)
+        if request.method != 'NOTIFY':
+            self._logger.warning('invalid method on notification path : %s', request.method)
 
         if request.headers.get('SID', '') != getattr(self._subscription, 'sid', None):
             return (412,)
@@ -357,7 +351,7 @@ returns:
             if k in args and args[k] is not None and a.state_variable:
                 args[k] = a.state_variable.serialize(args[k])
 
-        return self.service._do_action(self.name, _cb, args)
+        return self.service._action(self.name, _cb, args)
 
 class ActionError(Exception):
     pass
@@ -407,7 +401,6 @@ class Subscription(object):
     
     def __init__(self, service):
         self.service = service
-        self.conm = self.service._parents[0]._conm
         self.sid = None
         self.alarm = None
         self.upnpy = service._upnpy
@@ -426,18 +419,15 @@ class Subscription(object):
         else:
             headers['NT'] = 'upnp:event'
 
-        request = self.conm.create_request(self.service._absurl(self.service.eventSubURL),
-                                                                'SUBSCRIBE', headers=headers)
-        request.callback = self._subscribed
+        self.service._request(self.service._absurl(self.service.eventSubURL), 'SUBSCRIBE',
+                               self._subscribed,
+                               headers=headers,
+                               on_connect=self._set_callback if not self.sid else None)
 
-        if not self.sid:
-            def on_connect(request):
-                request.headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
-                    (request.connection.getsockname()[0],
-                     self.upnpy._http.server_port)
-            request.on_connect = on_connect
-
-        self.conm.send(request)
+    def _set_callback(self, request):
+        request.headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
+            (request.connection.getsockname()[0],
+             self.upnpy._http.server_port)       
 
     def _subscribed(self, response):
         if response.code != '200':
@@ -454,15 +444,18 @@ class Subscription(object):
         self.upnpy._subscriptions[self.sid] = weakref.ref(self)
 
         expiry = int(response.headers.get('TIMEOUT', '-%d' % self.service.EXPIRY).split('-')[1])
+        if self.alarm:
+            self.upnpy.remove_alarm(self.alarm)
         self.alarm = self.upnpy.set_alarm(self.renew, expiry/2)
 
     def renew(self):
         self.subscribe()
 
     def unsubscribe(self):
-        self.service._upnpy.remove_alarm(self.alarm)
-        self.service._request(self.service._absurl(self.service.eventSubURL), 'UNSUBSCRIBE', self._unsubscribed,
-        headers=dict(SID=self.sid))        
+        self.upnpy.remove_alarm(self.alarm)
+        self.service._request(self.service._absurl(self.service.eventSubURL), 'UNSUBSCRIBE',
+                              self._unsubscribed,
+                              headers=dict(SID=self.sid))        
 
         self.service._subscription = None        
 
@@ -492,8 +485,11 @@ class Device(UPnPObject):
         if desc:
             self._parse(desc)
         else:
-            self._describe(location,
-                           self._parse)
+            self._describe()
+
+    def _describe(self):
+        self._do_describe(self._location,
+                          self._parse)
 
     def _parse(self, description):
 

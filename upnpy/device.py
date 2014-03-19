@@ -41,7 +41,7 @@ class BaseUPnPObject(object):
 
         part = request.path[0]
 
-        method = getattr(self, '_%s_%s' % (request.command, part.replace('.','_')), None)
+        method = getattr(self, '_%s_%s' % (request.method, part.replace('.','_')), None)
         if len(request.path) == 1 and method:
             return method(request, **request.query)
             
@@ -554,14 +554,12 @@ class _Subscription(object):
 
     def __init__(self, service, callback, timeout):
         self.service = service
+        self.upnpy = service._parents[0]._upnpy
         self.callback = callback
         self.sid = utils.genUUID()
         self.seq = 0
                                                  
         self.renew(timeout)
-
-        from http import ConnectionManager
-        self.conm = ConnectionManager(self.service._parents[0]._upnpy)
 
     def renew(self, timeout):
         self.missed = 0
@@ -569,14 +567,14 @@ class _Subscription(object):
 
     def notify(self, message):
         
-        self.conm.send_request(self.callback, 'NOTIFY',
-                               callback=self._notify_response,
-                               headers = { 'NT' : 'upnp:event',
-                                           'NTS': 'upnp:propchange',
-                                           'SID': self.sid,
-                                           'SEQ': self.seq,
-                                           'CONTENT-TYPE': 'text/xml; charset="utf-8"'},
-                               body = message)
+        self.upnpy.http_request(self.callback, 'NOTIFY',
+                                callback=self._notify_response,
+                                headers = { 'NT' : 'upnp:event',
+                                            'NTS': 'upnp:propchange',
+                                            'SID': self.sid,
+                                            'SEQ': self.seq,
+                                            'CONTENT-TYPE': 'text/xml; charset="utf-8"'},
+                                body = message)
         self.seq += 1
 
     def _notify_response(self, resp):

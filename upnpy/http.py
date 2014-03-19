@@ -108,10 +108,7 @@ class _HTTPMessage(object):
     server_version = "Upnpy/" + str(__version__)
     sys_version = "Python/" + sys.version.split()[0]    
 
-    def __init__(self, firstline=None, headers=None, body=None, http_version = None):
-
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.access_logger = logging.getLogger('http.access')
+    def __init__(self, firstline=None, headers=None, body=None, http_version=None, on_connect=None):
 
         self.connection = None
 
@@ -121,13 +118,22 @@ class _HTTPMessage(object):
         self.headers = Headers(headers or {})
         self.body = body
 
+        self._generator = None
         self._discard_body = False
         self.sent = False
+        self.on_connect = on_connect
 
-        self.on_connect = None
+        self.set_logger()
+        self.access_logger = logging.getLogger('http.access')
+
+    def set_logger(self):
+        name = self.__class__.__name__
+        if self.firstline:
+            name += ".%s" % self.firstline
+        self.logger = logging.getLogger(name)
 
     def next(self, connection):
-        if not hasattr(self, '_generator'):
+        if not self._generator:
             self._generator = iter(self)
             self.connection = connection
             if callable(self.on_connect):
@@ -163,7 +169,7 @@ class _HTTPMessage(object):
     #                       **(headers or {}))
     #     headers, body = self.adjust_content(headers, body)
     #     self.send_headers(headers, body)
-    #     if self.command != 'HEAD' and code >= 200 and code not in (204, 304):
+    #     if self.method != 'HEAD' and code >= 200 and code not in (204, 304):
     #         self.send_body(body)
     #     if headers.get('Connection', 'close').lower() != 'keep-alive':
     #         self.connection.close_when_done()
@@ -180,7 +186,7 @@ class _HTTPMessage(object):
     #                   (self.http_version, code, status))
     #         # print (self.protocol_version, code, status)
 
-    # def send_requestline(self, command, path, http_version=None):
+    # def send_requestline(self, method, path, http_version=None):
     #     """Send the response header and log the response code.
 
     #     Also send two standard headers with the server software
@@ -188,7 +194,7 @@ class _HTTPMessage(object):
 
     #     """
     #     self.send("%s %s %s\r\n" %
-    #                   (command, path, version or self.http_version))
+    #                   (method, path, version or self.http_version))
 
     def adjust_content(self):
         
@@ -308,7 +314,9 @@ _quote_html = BaseHTTPServer._quote_html
 
 class HTTPRequest(_HTTPMessage):
 
-    def __init__(self, command=None, path=None, *args, **kwargs):
+    RETRY = 3
+
+    def __init__(self, method=None, path=None, *args, **kwargs):
 
         self.callback = None
         self.response = None
@@ -316,14 +324,16 @@ class HTTPRequest(_HTTPMessage):
 
         _HTTPMessage.__init__(self, *args, **kwargs)
 
-        if command and path:
-            self.command = command
+        if method and path:
+            self.method = method
             self.path = path
-            self.firstline = "%s %s %s"  % (command, path, self.http_version)
+            self.firstline = "%s %s %s"  % (method, path, self.http_version)
         elif self.firstline:
             self.parse_requestline()
         else:
-            raise ValueError("neither firstline nor (command,path) set!")
+            raise ValueError("neither firstline nor (method,path) set!")
+
+        self.set_logger()
 
     def parse_requestline(self):
 
@@ -337,7 +347,7 @@ class HTTPRequest(_HTTPMessage):
         else:
             self.respond(400, "Bad request syntax (%r)" % self.firstline)
 
-        self.command, self.path = rl[0:2]
+        self.method, self.path = rl[0:2]
 
     def adjust_headers(self):
         self.headers.set_if_unset('User-Agent', self.version_string())
@@ -347,13 +357,15 @@ class HTTPRequest(_HTTPMessage):
 
         if self.response:
             raise Exception('response already set!')
+
+        self.log_request(code)
         
         self.response = HTTPResponse(code=code, status=status, http_version=self.http_version,
                             headers = Headers(headers,
                                               Connection=self.headers.get('Connection', 'Keep-Alive')),
                             body = body)
 
-        if self.command == 'HEAD' or code < 100 or code in (204, 304):
+        if self.method == 'HEAD' or code < 100 or code in (204, 304):
             self.response._discard_body = True
 
         self.connection.handle_write_event()
@@ -365,6 +377,13 @@ class HTTPRequest(_HTTPMessage):
         self.response = response
         if callable(self.callback):
             self.callback(response)
+
+    def prepare_retry(self):
+        self.logger.warning('retrying failed request')
+        self.sent = False
+        self.response = None
+        self._generator = None
+        self._retries += 1
 
 class HTTPResponse(_HTTPMessage):
 
@@ -379,7 +398,7 @@ class HTTPResponse(_HTTPMessage):
         else:
             raise ValueError("neither firstline nor code set!")
 
-        self.response = None
+        self.set_logger()
 
     @classmethod
     def from_exception(cls, exception):
@@ -399,11 +418,6 @@ class HTTPResponse(_HTTPMessage):
             raise Exception("invalid response code '%s'" % self.rl[1])
                     
         self.http_version, self.code, self.status = rl            
-
-    def next(self, connection):
-        ret = _HTTPMessage.next(self, connection)        
-        self.log_request(self.code)
-        return ret
 
     def adjust_headers(self):
         self.headers.set_if_unset('Server', self.version_string())
@@ -441,7 +455,7 @@ class _HTTPConnection(LoggedDispatcher,asynchat.async_chat):
 
     def idle(self):
         if time.time() > self.last_activity + self.keep_alive:
-            self.logger.info('closing idle connection')
+            self.logger.debug('closing idle connection')
             self.handle_close()
 
     def create_socket(self):
@@ -720,17 +734,7 @@ class ConnectionManager(object):
         self.connections = dict()
         self.pending = dict()
 
-    def send_request(self, url, command, callback, headers=None, body=None):
-        #logging.error("send_request %s %s %r %r", url, command, callback, headers)
-
-        request = self.create_request(url, command,
-                            headers=headers, body=body)
-
-        request.callback = callback
-
-        self.send(request)
-
-    def create_request(self, url, command, headers=None, body=None):
+    def create_request(self, url, method, callback=None, headers=None, body=None, **kwargs):
 
         up = urlparse.urlparse(url)
 
@@ -741,11 +745,24 @@ class ConnectionManager(object):
             from ussl import SSLHTTPClientConnection
             addr = (up.hostname, up.port or 443, SSLHTTPClientConnection)
                     
-        request = addr[2].REQUEST_CLASS(command=command,
+        request = addr[2].REQUEST_CLASS(method=method,
                                         path=urlparse.urlunparse((None, None)+up[2:]),
                                         headers=Headers(Host=up.netloc, **(headers or {})),
-                                        body=body)
+                                        body=body,
+                                        **kwargs)
         request._addr = addr
+        request._callback = callback
+
+        def cb(response):
+            if response.code <= 0 and request._retries < 3:
+                request.prepare_retry()
+                self.pending[addr].insert(0, request)
+                self.send_next(addr)
+            else:
+                self.send_next(addr)
+                request._callback(response)
+
+        request.callback = cb
 
         return request
 
@@ -778,6 +795,11 @@ class ConnectionManager(object):
             return
         request = self.pending[addr][0]
 
+        #filter non idempotent method if pipeline is already filled
+        if request.method not in ('GET', 'DELETE', 'PUSH', 'HEAD', 'NOTIFY', 'SUBSCRIBE') and \
+                (not addr in self.connections or self.connections[addr].pipeline):
+            return
+
         if not addr in self.connections \
                 or (not self.connections[addr].connected \
                         and not self.connections[addr].connecting):
@@ -788,25 +810,8 @@ class ConnectionManager(object):
         if conn.pipeline and not conn.pipelining:
             return
 
-        #filter non idempotent method for pipelining
-        if request.command not in ('GET', 'DELETE', 'PUSH', 'HEAD', 'NOTIFY', 'SUBSCRIBE') and conn.pipeline:
-            return
-
         self.pending[addr].pop(0)
 
-        def cb(response):
-            if response.code == 0 and request._retries < 3:
-                request.response = None
-                request._generator = None
-                request._retries += 1
-                self.send(request)
-            else:
-                self.send_next(addr)
-                request._callback(response)
-
-        request._callback, request.callback = request.callback, cb
-
-        #logging.error("conn send_request %s %s %s %r %r", conn, url, command, callback, headers)
         conn.send_request(request)
        
     def clean(self):

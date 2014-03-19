@@ -184,9 +184,9 @@ class SSDPRequest(http.HTTPRequest):
             return self.respond(400, "Bad request syntax (%r)" % self.firstline)
 
         if rl[2].startswith('HTTP/'):
-            self.command, self.path, self.request_version = rl
+            self.method, self.path, self.request_version = rl
         elif rl[0].startswith('HTTP/'):
-            self.request_version, self.command, self.status = rl
+            self.request_version, self.method, self.status = rl
         else:
             return self.respond(400, "Bad request syntax (%r)" % self.firstline)
 
@@ -238,11 +238,11 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             
 
     def handle_request(self, request):
-        method = getattr(self, 'do_'+request.command.replace('-', '_'), None)
+        method = getattr(self, 'do_'+request.method.replace('-', '_'), None)
         if callable(method):
             method(request)
         else:
-            self.logger.error("unhandled method %s", request.command)
+            self.logger.error("unhandled method %s", request.method)
             
     def do_M_SEARCH(self, request):
         if self.address == '': return
@@ -324,10 +324,10 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         #                 MX=int(mx),
         #                 ST=type))
 
-    def send_request(self, to, command, path, headers=None, body=None):
+    def send_request(self, to, method, path, headers=None, body=None):
         conn = SSDPClientConnection(self, to)
         request = conn.REQUEST_CLASS(
-            command=command,
+            method=method,
             path=path,
             headers=http.Headers({
                     'HOST':'%s:%d' % to},

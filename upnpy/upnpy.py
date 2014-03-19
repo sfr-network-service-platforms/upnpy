@@ -28,6 +28,7 @@ class Upnpy(object):
         self._alarms = []
         self._idle = []
         self._stop = False
+        self._looping = False
 
         self._descriptions= {}
         self._subscriptions = {}
@@ -36,6 +37,7 @@ class Upnpy(object):
         self._ssdp = SSDPServer(self)
         self._http = None
         self._https = None
+        self._connection_manager = None
 
         import atexit
         atexit.register(self.clean)
@@ -84,10 +86,15 @@ class Upnpy(object):
 
     def serve_while(self, condition):
 
+        self._looping = True
+
         while condition() and not self._stop:
             self.serve_once()
 
+        self._looping = False
+
     def serve_once(self):
+
 
         now = time.time()
         TIMEOUT = 5.0
@@ -106,6 +113,23 @@ class Upnpy(object):
 
         for i in self._idle:
             i()
+
+    def http_request(self, url, method='GET', callback=None, headers=None, body=None, **kwargs):
+
+        if not self._connection_manager:
+            from http import ConnectionManager
+            self._connection_manager = ConnectionManager(self)
+
+        request = self._connection_manager.create_request(url, method, callback, headers=headers, body=body, **kwargs)
+
+        self._connection_manager.send(request)
+        
+        if not self._looping:
+            start = time.time()
+            self.serve_while(lambda:request.response is None and time.time() < start+5.0)
+            if not callback:
+                from http import HTTPResponse
+                return request.response or HTTPResponse(0, 'timeout')
 
     def stop(self):
         self.clean()

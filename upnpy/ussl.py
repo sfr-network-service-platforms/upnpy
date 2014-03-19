@@ -75,7 +75,6 @@ if sslpackage == 'm2crypto':
                 self.do_close()
                         
         def handle_read_event(self):
-            #self.logger.info('handle_read_event %s %s %s %s', self.ssl_handshake_pending, self.ssl_shutdown_pending, self.connected, self.connecting)
             try:
                 if self.ssl_handshake_pending:
                     self.do_ssl_handshake()
@@ -89,7 +88,6 @@ if sslpackage == 'm2crypto':
                 self.handle_error()
 
         def handle_write_event(self):
-            #self.logger.info('handle_write_event %s %s %s %s', self.ssl_handshake_pending, self.ssl_shutdown_pending, self.connected, self.connecting)
             try:
                 if self.ssl_handshake_pending:
                     self.do_ssl_handshake()
@@ -102,17 +100,7 @@ if sslpackage == 'm2crypto':
                 self.socket.clear()
                 self.handle_error()
 
-        def send(self, data):
-            #self.logger.info('send : %s', data)
-            return _HTTPConnection.send(self, data)
-
-        def recv(self, size):
-            data = _HTTPConnection.recv(self, size) 
-            #self.logger.debug('recv : %s', data)
-            return data     
-
         def close(self):
-            self.logger.info("close %s %s", self.connected, self.ssl_shutdown_pending)
             if self.connected == True and not self.ssl_shutdown_pending:
                 self.ssl_shutdown_pending = True 
                 self.do_ssl_shutdown()
@@ -161,7 +149,6 @@ if sslpackage == 'm2crypto':
 
         if type:
             with certificate(type) as certfile:
-                logging.error('certfile %s', certfile)
                 ctx.load_cert(certfile)
 
             if type == 'device':
@@ -185,14 +172,14 @@ if sslpackage == 'm2crypto':
             state = "SSL state unknown"
 
         if (where & m2.SSL_CB_LOOP):
-            logger.info("LOOP: %s: %s", state, m2.ssl_get_state_v(ssl_ptr))
+            logger.debug("LOOP: %s: %s", state, m2.ssl_get_state_v(ssl_ptr))
             return
 
         if (where & m2.SSL_CB_EXIT):
             if not ret:
-                logger.info("FAILED: %s: %s", state, m2.ssl_get_state_v(ssl_ptr))
+                logger.error("FAILED: %s: %s", state, m2.ssl_get_state_v(ssl_ptr))
             else:
-                logger.info("INFO: %s: %s", state, m2.ssl_get_state_v(ssl_ptr))
+                logger.debug("INFO: %s: %s", state, m2.ssl_get_state_v(ssl_ptr))
             return
 
         if (where & m2.SSL_CB_ALERT):
@@ -200,12 +187,12 @@ if sslpackage == 'm2crypto':
                 w = 'read'
             else:
                 w = 'write'
-            logger.info("ALERT: %s: %s: %s", \
+            logger.debug("ALERT: %s: %s: %s", \
                 w, m2.ssl_get_alert_type_v(ret), m2.ssl_get_alert_desc_v(ret))
             return
 
     def _ssl_verify_peer(ssl_ctx_ptr, x509_ptr, errnum, errdepth, ok):
-        logging.getLogger('http.ssl').info('verify %s %s %s %s %s', ssl_ctx_ptr, x509_ptr, errnum, errdepth, ok)
+        logging.getLogger('http.ssl').debug('verify %s %s %s %s %s', ssl_ctx_ptr, x509_ptr, errnum, errdepth, ok)
         # Deprecated
         return True
 
