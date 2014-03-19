@@ -134,9 +134,9 @@ class Service(UPnPObject):
             self._subscribe()
 
     def _action(self, action, _cb, args):
-
+        
         ret = self._request(self._absurl(self.controlURL), 'POST',
-                            lambda response:self._result(action, response, _cb) if _cb else None,
+                            (lambda response:self._result(action, response, _cb)) if _cb else None,
                             headers = {'Content-Type': 'text/xml; charset="utf-8"',
                                        'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
                             body=self._soapQuery(action, args))
@@ -194,7 +194,7 @@ class Service(UPnPObject):
 
     def _soapQuery(self, action, args):
 
-        env = ElementTree.Element(SQNS('Enveloppe'), {SQNS('encodingStyle'):SES})
+        env = ElementTree.Element(SQNS('Envelope'), {SQNS('encodingStyle'):SES})
         act = ElementTree.SubElement(ElementTree.SubElement(env,SQNS('Body')), self._stns(action))
         
         for k, v in args.iteritems():
@@ -202,26 +202,44 @@ class Service(UPnPObject):
             if v is not None:
                 e.text=str(v)
             
-        return utils.tostring(env, encoding='utf-8', default_namespace=self._stns.ns)
+        return utils.tostring(env, encoding='utf-8', default_namespace=SQNS.ns, xml_declaration=True)
 
     def _parseSoapResponse(self, action, response):
 
         ret = {}
-        
+
+        if response.body is None:
+            raise ActionError('HTTP body not found (http : %s %s)', response.code, response.body)        
+
         body = ElementTree.fromstring(response.body).find(SQNS('Body'))
-        response = body.find(self._stns(action+'Response'))
-        if response is None:
-            desc = body.find(SQNS('Fault/')+SQNS('detail/')+CNS('UPnPError/')+CNS('errorDescription'))
+        if body is None:
+            raise ActionError('Soap body not found')
+
+        action_response = body.find(self._stns(action+'Response'))
+        if action_response is None and body.find(SQNS('Fault')) is None and len(list(body))>0:
+            action_response = list(body)[0]
+            self._logger.warning("spurious response node tag '%s'", action_response.tag)       
+
+        if action_response is None:
+            
+            fault = body.find(SQNS('Fault'))
+            if fault is None:              
+                raise ActionError('No response found')
+
+            desc = fault.find(SQNS('detail/')+CNS('UPnPError/')+CNS('errorDescription')) \
+                or fault.find('detail/'+CNS('UPnPError/')+CNS('errorDescription'))
             if desc is not None:
                 raise ActionError(desc.text)
-            fs = body.find(SQNS('Fault/')+SQNS('faultstring'))
+
+            fs = fault.find(SQNS('faultstring'))
             if fs is not None:
                 raise ActionError(fs.text)
-            raise ActionError()
+
+            raise ActionError("Unknown error (http : %s %s)", response.code, response.body)
 
         stnse = self._stns("")
 
-        for e in list(response):
+        for e in list(action_response):
             name = e.tag
             value = e.text
             if name.startswith(stnse):

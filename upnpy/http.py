@@ -760,7 +760,8 @@ class ConnectionManager(object):
                 self.send_next(addr)
             else:
                 self.send_next(addr)
-                request._callback(response)
+                if callable(request._callback):
+                    request._callback(response)
 
         request.callback = cb
 

@@ -124,7 +124,7 @@ class Upnpy(object):
 
         self._connection_manager.send(request)
         
-        if not self._looping:
+        if not self._looping or not callback:
             start = time.time()
             self.serve_while(lambda:request.response is None and time.time() < start+5.0)
             if not callback:
