@@ -106,6 +106,9 @@ if sslpackage == 'm2crypto':
                 self.do_ssl_shutdown()
             else:
                 self.logger.warning("close already required ...")
+                self.ssl_shutdown_pending = False
+                self.connected = False
+                self.do_close()
 
         do_close = _HTTPConnection.close
 

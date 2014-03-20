@@ -375,6 +375,8 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             # winsock sometimes raises ENOTCONN
             if why.args[0] in asyncore._DISCONNECTED:
                 return ''
+            elif why.args[0] in asyncore.EAGAIN:
+                return (None, None)
             else:
                 raise 
 
