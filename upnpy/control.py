@@ -72,7 +72,6 @@ class UPnPObject(object):
 class Service(UPnPObject):
 
     _ATTRS = ['serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL']
-    EXPIRY = 300
 
     def __init__(self, upnpy, location, parent=None, handler=None, desc=None):
         super(Service, self).__init__(upnpy, location, parent, handler)
@@ -418,6 +417,8 @@ class StateVariable(utils.StateVariable):
 
 class Subscription(object):
     
+    EXPIRY = 300
+
     def __init__(self, service):
         self.service = service
         self.sid = None
@@ -432,7 +433,7 @@ class Subscription(object):
             from http import HTTPServer
             self.upnpy._http = HTTPServer(self.upnpy)
 
-        headers = dict(TIMEOUT='Second-%d'%self.service.EXPIRY)
+        headers = dict(TIMEOUT='Second-%d'%self.EXPIRY)
         if self.sid:
             headers['SID'] = self.sid
         else:
@@ -462,7 +463,7 @@ class Subscription(object):
         import weakref
         self.upnpy._subscriptions[self.sid] = weakref.ref(self)
 
-        expiry = int(response.headers.get('TIMEOUT', '-%d' % self.service.EXPIRY).split('-')[1])
+        expiry = int(response.headers.get('TIMEOUT', '-%d' % self.EXPIRY).split('-')[1])
         if self.alarm:
             self.upnpy.remove_alarm(self.alarm)
         self.alarm = self.upnpy.set_alarm(self.renew, expiry/2)
@@ -585,7 +586,7 @@ class BaseDiscoveryHandler(object):
         return True
 
     def create(self, ssdp):
-        return self.device_class(self.upnpy, ssdp.seclocation or ssdp.location,
+        return self.device_class(self.upnpy, ssdp.headers.get('SECURELOCATION.UPNP.ORG', ssdp.headers['LOCATION']),
                                  handler=lambda o:self._created(o, ssdp))
 
     def _created(self, obj, ssdp):
@@ -599,10 +600,22 @@ class BaseDiscoveryHandler(object):
 
 class SearchHandler(BaseDiscoveryHandler):
 
-    def __init__(self, upnpy, target, *args, **kwargs):
-        super(SearchHandler, self).__init__(upnpy, *args,**kwargs)
+    def __init__(self, upnpy, target, timeout=5.0, *args, **kwargs):
+        super(SearchHandler, self).__init__(upnpy, *args,**kwargs)        
+        
+        if target == '*':
+            target = 'ssdp:all'
+        elif target.split(':')[0] not in ['ssdp', 'upnp', 'uuid']:
+            target = target.split(':')
+            if target[0] != 'urn':
+                target = ['urn', 'schemas-upnp-org'] + target
+            if len(target) == 4:
+                target += ['1']
+            target = ":".join(target)
+
         self.target = target
         self.matches = []
+        self.upnpy._ssdp.msearch(self.target, timeout/2.0)
 
     def match(self, ssdp):
         #logging.info('match %s ? %s', self.target, ssdp)

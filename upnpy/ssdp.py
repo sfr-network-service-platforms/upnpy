@@ -29,7 +29,7 @@ class SSDPServer(object):
 
         self._seen = {}
         self._handlers = []
-        self._advertisement = {}
+        self._advertisement = dict()
         
         self._iface_servers = []
 
@@ -63,10 +63,13 @@ class SSDPServer(object):
 
     def _advertise(self, devser, type, usn):
 
+        headers = http.Headers(LOCATION=devser._location)
+        if devser._protection:
+            headers['SECURELOCATION.UPNP.ORG'] = devser._location
+
         e = SSDPEntry(usn,
                       type,
-                      devser._location,
-                      devser._location if devser._protection else None,
+                      headers,
                       devser.EXPIRY,
                       None)
         self._notify(e, 'alive')
@@ -85,12 +88,16 @@ class SSDPServer(object):
 
     def _withdraw(self, devser, type, usn):
 
+        headers = http.Headers(LOCATION=devser._location)
+        if devser._protection:
+            headers['SECURELOCATION.UPNP.ORG'] = devser._location
+
         e = SSDPEntry(usn,
                       type,
-                      devser._location,
-                      devser._location if devser._protection else None,
+                      headers,
                       devser.EXPIRY,
                       None)
+
         if e not in self._advertisement:
             return
 
@@ -130,9 +137,9 @@ class SSDPServer(object):
     #                 body=body,
     #                 to=(self.MIP, self.PORT)).dump(server.socket)
 
-    def alive(self, usn, type, location, seclocation, expiry):
+    def alive(self, usn, type, headers, expiry):
 
-        entry = SSDPEntry(usn, type, location, seclocation, expiry,
+        entry = SSDPEntry(usn, type, headers, expiry,
                           filter(lambda d:d(), self._seen[usn].devices) if usn in self._seen else [])
             
         if usn not in self._seen:
@@ -204,7 +211,7 @@ class SSDPResponse(http.HTTPResponse):
         self.headers.set_if_unset('SERVER', self.version_string())
 
 import collections
-SSDPEntry = collections.namedtuple('SSDPEntry', 'usn type location seclocation, expiry, devices')
+SSDPEntry = collections.namedtuple('SSDPEntry', 'usn type headers expiry devices')
 
 class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
 
@@ -261,14 +268,18 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
                       a.type,
                       a.usn]:
 
-                headers={
+                #send SSDPEntry headers
+                headers=a.headers.copy()
+                #append common headers
+                headers.update({
                         'ST': a.type,
                         'USN': a.usn,
-                        'LOCATION': self._url(a.location),
                         'CACHE-CONTROL':'max-age=%d' % a.expiry,
-                        'EXT': ''}
-                if a.seclocation:
-                    headers['SECURELOCATION.UPNP.ORG'] = self._url(a.seclocation, True)
+                        'EXT': ''})
+                #modify location headers (host computed at send time)
+                for k in ['LOCATION', 'SECURELOCATION.UPNP.ORG']:
+                    if k in a.headers:
+                        headers[k] = self._url(a.headers[k], True)
                 request.respond(200, headers=headers)
 
     def do_NOTIFY(self, request):
@@ -283,8 +294,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             self.server.alive(
                 usn,
                 request.headers.get('NT', None),
-                request.headers.get('Location', None),
-                request.headers.get('SECURELOCATION.UPNP.ORG', None),
+                request.headers,
                 expiry
                 )
         elif activity == 'byebye':
@@ -301,21 +311,23 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
         self.server.alive(
             request.headers.get('USN',None),
             request.headers.get('ST', None),
-            request.headers.get('Location', None),
-            request.headers.get('SECURELOCATION.UPNP.ORG', None),
+            request.headers,
             expiry
             )
 
     def notify(self, ssdp, activity):
 
+        #send SSDPEntry headers
+        headers = ssdp.headers.copy()
+        #append common headers
         headers={'NT': ssdp.type,
                  'USN': ssdp.usn,
                  'NTS': 'ssdp:%s' % activity,
-                 'LOCATION': self._url(ssdp.location),
                  'CACHE-CONTROL': 'max-age=%d' % ssdp.expiry}
-        if ssdp.seclocation:
-            headers['SECURELOCATION.UPNP.ORG'] = self._url(ssdp.seclocation, True)
-        
+        #modify location headers (host computed at send time)
+        for k in ['LOCATION', 'SECURELOCATION.UPNP.ORG']:
+            if k in ssdp.headers:
+                headers[k] = self._url(ssdp.headers[k], True)
         self.send_request((self.server.MIP, self.server.PORT), 'NOTIFY', '*', headers=headers)
 
     def msearch(self, type, mx):
@@ -375,7 +387,7 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
             # winsock sometimes raises ENOTCONN
             if why.args[0] in asyncore._DISCONNECTED:
                 return ''
-            elif why.args[0] in asyncore.EAGAIN:
+            elif why.args[0] in (asyncore.EAGAIN,):
                 return (None, None)
             else:
                 raise 

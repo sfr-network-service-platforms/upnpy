@@ -190,11 +190,12 @@ class Service(BaseService):
         except AttributeError:
             pass
         else:
-            cp = ControlPoint.get(
-                ussl.cert_uuid(cert),
-                cert.get_subject().CN)
-            self._logger.debug("control point : %s", cp)
-            rp.identities.append(cp)
+            if cert:
+                cp = ControlPoint.get(
+                    ussl.cert_uuid(cert),
+                    cert.get_subject().CN)
+                self._logger.debug("control point : %s", cp)
+                rp.identities.append(cp)
 
         for i in rp.identities:
             rp.roles |= i.roles

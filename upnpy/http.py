@@ -836,6 +836,9 @@ class Headers(IterableUserDict):
     def set_if_unset(self, key, value):
         if key not in self:
             self[key] = value
+
+    def __hash__(self):
+        return hash(frozenset(self.data.items()))
     
 def main():
     import upnpy

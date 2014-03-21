@@ -85,7 +85,7 @@ if sslpackage == 'm2crypto':
             except SSL.SSLError, e:
                 self.logger.error("handle_read_event : %s", e)
                 self.socket.clear()
-                self.handle_error()
+                self.handle_close()
 
         def handle_write_event(self):
             try:
@@ -98,7 +98,7 @@ if sslpackage == 'm2crypto':
             except SSL.SSLError, e:
                 self.logger.error("handle_write_event : %s", e)
                 self.socket.clear()
-                self.handle_error()
+                self.handle_close()
 
         def close(self):
             if self.connected == True and not self.ssl_shutdown_pending:

@@ -47,13 +47,18 @@ class Upnpy(object):
         Returns a list of device/service when at least one matching is found
         
         Args:
-          target (string) : a UPnP defined search target or "*" for all
+          target (string) : a UPnP defined search target :
+            - ssdp:all (or *) : for all devices and services
+            - upnp:rootdevice : for all root devices
+            - uuid:[uuid]     : for a particular device
+            - [urn:domain:]{device,service}:type[:version] : for a device or service with the given type
+                                domain default to schemas-upnp-org,
+                                version to 1
+
           timeout (number, optionnal) : timeout for search (default to 5 seconds)"""        
 
         from control import SearchHandler
-        if target == '*': target = 'ssdp:all'
-        self._ssdp.msearch(target, timeout/2)
-        h = SearchHandler(self, target)
+        h = SearchHandler(self, target, timeout)
         self.add_handler(h)
         if not len(h.matches) and timeout:
             start = time.time()
@@ -65,7 +70,7 @@ class Upnpy(object):
         """search a device/service
         Returns when at least one matching devices is found
 
-        target (string) : a UPnP defined search target or "*" for all
+        target (string) : a UPnP defined search target or "*" for ssdp:all
         timeout (number) : an optionnal timeout (default to 5 seconds)"""
 
         matches = self.search(target, timeout/2)
