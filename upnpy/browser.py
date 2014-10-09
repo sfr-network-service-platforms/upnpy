@@ -22,68 +22,6 @@ import logging
 logging.basicConfig()
 
 u = upnpy.Upnpy()
-
-from http import LoggedDispatcher
-
-class Watch(LoggedDispatcher, asyncore.dispatcher):
-
-    def __init__(self, fd, callback):
-        LoggedDispatcher.__init__(self)
-        asyncore.dispatcher.__init__(self, map=u._map)
-
-        self.socket = fd
-        self._fileno = fd
-        self.callback = callback
-        self.add_channel()
-
-    def handle_read_event(self):
-        try:
-            self.callback()
-        except urwid.main_loop.ExitMainLoop:
-            u.stop()
-
-        #print "read"
-        #raise Exception
-
-    def handle_close(self):
-        #import os
-        #os.close(self._fileno)
-        self.connected = False
-        self.accepting = False
-        self.connecting = False
-        self.del_channel()
-
-    def writable(self):
-        return False
-
-class UpnpyEventLoop(object):
-
-    def alarm(self, seconds, callback):
-        return u.set_alarm(callback, seconds)
-
-    def remove_alarm(self, handle):
-        u.remove_alarm(handle)
-
-    def watch_file(self, fd, callback):
-        # import os, logging
-        # logging.error(fd)
-        # logging.error(os.readlink('/proc/self/fd/%d' %fd))
-        # #print os.system('ls -l /proc/self/fd/')
-        # #raise Exception(fd)
-        Watch(fd, callback)
-        return fd
-
-    def remove_watch_file(self, handle):
-        del u._map[handle]
-
-    def enter_idle(self, callback):
-        return u.set_idle(callback)
-
-    def remove_enter_idle(self, handle):
-        u.remove_idle(handle)
-
-    def run(self):
-        u.serve_forever()
             
 class DeviceListBox(urwid.BoxAdapter):
 
@@ -120,7 +58,7 @@ class ServiceNode(urwid.TreeNode):
 class ObjTreeWidget(urwid.TreeWidget):
     def load_inner_widget(self):
         but = urwid.Button(self.get_display_text())
-        #urwid.connect_signal(but, 'click', lambda:logging.error('pressed'))
+        urwid.connect_signal(but, 'click', logging.error, 'pressed')
         return but
 
 class DeviceTreeWidget(ObjTreeWidget):
@@ -156,7 +94,7 @@ class MyLogHandler(logging.Handler):
         logging.Handler.__init__(self)
         self.repl = repl
         self.setFormatter(logging.Formatter())#"%(name)s"))
-        self.formatter._fmt = "%(name)s : "+ self.formatter._fmt
+        self.formatter._fmt = "%(created)d %(name)s : "+ self.formatter._fmt
 
     def emit(self, record):
         msg = self.format(record)
@@ -166,7 +104,55 @@ class MyURWIDRepl(bpython.URWIDRepl):
 
     def __init__(self, event_loop, palette, interpreter, config):
 
-        super(MyURWIDRepl, self).__init__(UpnpyEventLoop(), palette, interpreter, config)
+        import urwid_geventloop
+        from bpython import repl
+        #super(MyURWIDRepl, self).__init__(urwid_geventloop.GeventLoop(), palette, interpreter, config)
+        repl.Repl.__init__(self, interpreter, config)
+
+        self._redraw_handle = None
+        self._redraw_pending = False
+        self._redraw_time = 0
+
+        self.listbox = bpython.BPythonListBox(urwid.SimpleListWalker([]))
+
+        self.tooltip = urwid.ListBox(urwid.SimpleListWalker([]))
+        self.tooltip.grid = None
+        self.overlay = bpython.Tooltip(self.listbox, self.tooltip)
+        self.stdout_hist = ''
+
+        self.frame = urwid.Frame(self.overlay)
+
+        if urwid.get_encoding_mode() == 'narrow':
+            input_filter = decoding_input_filter
+        else:
+            input_filter = None
+
+        # This constructs a raw_display.Screen, which nabs sys.stdin/out.
+        self.main_loop = urwid.MainLoop(
+            self.frame, palette,
+            event_loop=urwid_geventloop.GeventLoop(), unhandled_input=self.handle_input,
+            input_filter=input_filter, handle_mouse=False, screen = MyScreen())
+
+        # String is straight from bpython.cli
+        self.statusbar = bpython.Statusbar(config,
+            bpython._(" <%s> Rewind  <%s> Save  <%s> Pastebin "
+              " <%s> Pager  <%s> Show Source ") %
+              (config.undo_key, config.save_key, config.pastebin_key,
+               config.last_output_key, config.show_source_key), self.main_loop)
+        self.frame.set_footer(self.statusbar.widget)
+        self.interact = bpython.URWIDInteraction(self.config, self.statusbar, self.frame)
+
+        self.edits = []
+        self.edit = None
+        self.current_output = None
+        self._completion_update_suppressed = False
+
+        # Bulletproof: this is a value extract_exit_value accepts.
+        self.exit_value = ()
+
+        bpython.load_urwid_command_map(config)
+
+
 
         logging.root.handlers=[MyLogHandler(self), logging.StreamHandler(file('/tmp/upnpy_browser.log', 'w'))]
         logging.root.setLevel(logging.INFO)
@@ -175,11 +161,11 @@ class MyURWIDRepl(bpython.URWIDRepl):
         self.devices = urwid.ListBox(urwid.SimpleListWalker([urwid.Text('Devices:')]))
         self.logs = urwid.ListBox(urwid.SimpleListWalker([]))
 
-        self.frame.set_footer(urwid.BoxAdapter(self.logs, 25))
+        self.frame.set_footer(urwid.BoxAdapter(self.logs, 15))
 
         self.main_frame = urwid.Columns([
                 self.frame,
-                ('fixed', 40, self.devices),
+                ('fixed', 35, self.devices),
                 ])
 
         self.main_loop.widget = self.main_frame
@@ -188,6 +174,27 @@ class MyURWIDRepl(bpython.URWIDRepl):
         u.add_handler(self.handler)
 
 bpython.URWIDRepl = MyURWIDRepl
+
+class threadsafe_iter:
+    """Takes an iterator/generator and makes it thread-safe by
+    serializing call to the `next` method of given iterator/generator.
+    """
+    def __init__(self, it):
+        self.it = it
+        import threading
+        self.lock = threading.Lock()
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        with self.lock:
+            return self.it.next()
+
+class MyScreen(urwid.raw_display.Screen):
+
+    def _run_input_iter(self):
+        return threadsafe_iter(urwid.raw_display.Screen._run_input_iter(self))
 
 class Service(control.Service):
 
@@ -201,13 +208,13 @@ class Device(control.Device):
         kwargs['service_class'] = Service
         super(Device, self).__init__(*args, **kwargs)        
         
-    def _byebye(self):
+    def _byebye(self, lost):
+        super(Device, self)._byebye(lost)
         if hasattr(self, 'repl'):
-            self._logger.info("byebye")
+            self._logger.info("byebye" + (" (lost)" if lost else ""))
             for dlb in self.repl.devices.body:
                 if getattr(dlb, 'device', None) == self:
                     self.repl.devices.body.remove(dlb)
-        super(Device, self)._byebye()
 
 class MyDiscoverHandler(control.BaseDiscoveryHandler):
 
@@ -216,9 +223,11 @@ class MyDiscoverHandler(control.BaseDiscoveryHandler):
     def __init__(self, upnpy, repl):
         self.repl = repl
         super(MyDiscoverHandler, self).__init__(upnpy, device_class=Device)
-        upnpy._ssdp.msearch(self.TARGET, 2.0)
+        upnpy.ssdp.msearch(self.TARGET, 1.0)
 
     def match(self, ssdp):
+        #if ssdp.type == self.TARGET:
+        #    self.logger.info('match %s', ssdp)
         return ssdp.type == self.TARGET
 
     def create(self, ssdp):
@@ -227,9 +236,12 @@ class MyDiscoverHandler(control.BaseDiscoveryHandler):
 
     def handle(self, device):
         device._logger.info("alive")
+        for dlb in self.repl.devices.body:
+            if hasattr(dlb, 'device') and dlb.device.USN == device.USN:
+                return 
+
         self.repl.devices.body.append(DeviceListBox(device))
         #if not hasattr(self.upnpy, devices
-
 
 def main():
 

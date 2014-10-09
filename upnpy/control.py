@@ -7,6 +7,8 @@ __copyright__ = 'Copyright (c) 2014 SFR (http://www.sfr.com)'
 __license__ = 'GNU LESSER GENERAL PUBLIC LICENSE Version 2.1'
 
 import utils 
+import urlparse, http
+import gevent
 
 try:
     from xml.etree import cElementTree as ElementTree
@@ -21,64 +23,57 @@ CNS = utils.Namespace('urn:schemas-upnp-org:control-1-0', 'control')
 ENS = utils.Namespace('urn:schemas-upnp-org:event-1-0', 'event')
 SES = "http://schemas.xmlsoap.org/soap/encoding/"
 
+STATE_DISCOVERED="discovered"
+STATE_READY="ready"
+STATE_BYEBYE="byebye"
+
 class UPnPObject(object):
 
-    _DESCRIPTIONS = dict()
-
-    def __init__(self, upnpy, location, parent=None, handler=None):
+    def __init__(self, upnpy, location):
 
         #temporary logger replaced after object description
         self._logger = logging.getLogger(self.__class__.__name__)
+        self._state = STATE_DISCOVERED 
 
         self._upnpy = upnpy
-        self._handler = handler
         self._location = location
-        self._parent = parent
-        
-    def _byebye(self):
-        self._parents[0]._clean()
 
-    def _request(self, url, method, callback, *args, **kwargs):
+    def _byebye(self, lost):
+        self._state = STATE_BYEBYE
 
-        return self._upnpy.http_request(url, method, callback, *args, **kwargs)
+    def _request(self, url, method, *args, **kwargs):
 
-    def _do_describe(self, location, cb):
-        if location in self._DESCRIPTIONS:
-            return cb(type('Response', (object,), dict(
-                        body=self._DESCRIPTIONS[location],
-                        code='200')))
+        req = http.HTTPRequest(url)
+        up = urlparse.urlparse(url)
+        req.request(method, urlparse.urlunparse(('','')+up[2:]), *args, **kwargs)
+        return req.getresponse(True)
 
-        self._request(location, 'GET', lambda resp: self._do_described(location, resp, cb))
-
-    def _do_described(self, location, response, cb):
-
-        desc = response.body
-
-        if response.code == '200' and desc:
-            self._DESCRIPTIONS[location] = desc
-
-        cb(response)
-
-    @property
-    def _parents(self):
-        ret = [self]
-        while ret[0]._parent:
-            ret.insert(0, ret[0]._parent)
-        return ret
-
-    def __del__(self):
-        self._parents[0]._clean()
+    def _describe(self, url):
+        return http.describe(url)
 
 class Service(UPnPObject):
 
     _ATTRS = ['serviceType', 'serviceId', 'SCPDURL', 'controlURL', 'eventSubURL']
 
-    def __init__(self, upnpy, location, parent=None, handler=None, desc=None):
-        super(Service, self).__init__(upnpy, location, parent, handler)
+    def __init__(self, upnpy, location, desc, parent, handler=None):
+        super(Service, self).__init__(upnpy, location)
 
         self._subscription = None
         self._parse_short(desc)
+        self.UDN = parent.UDN
         self._statevalues = {}
+        self._state = STATE_READY
+
+        self._logger = logging.getLogger('service.%s:%s' % (parent.friendlyName, self._shortType))
+
+        if handler:
+            handler(self)
+
+        if self.SCPDURL:
+            try:
+                self._parse(self._describe(self._absurl(self.SCPDURL)))
+            except Exception, e:
+                self._logger.error('cannot access service description : %s at %s', e, self._absurl(self.SCPDURL))
 
     def _parse_short(self, desc):
 
@@ -94,20 +89,12 @@ class Service(UPnPObject):
         else:
             st = ":".join(st)
         self._shortType = st
-
-        self._logger = logging.getLogger('service.%s:%s' % (self._parent.friendlyName, self._shortType))
-
-        if self.SCPDURL:
-            self._describe()
-
-    def _describe(self):
-        self._do_describe(self._absurl(self.SCPDURL), self._parse)
-            
+           
     def _parse(self, response):
 
         desc = None
-        if response.code != '200' or not response.body:
-            self._logger.error('cannot access service description : %s %s at %s', response.code, response.status, self._absurl(self.SCPDURL))
+        if response.status != 200 or not response.body:
+            self._logger.error('cannot access service description : %d %s at %s', response.status, response.reason, self._absurl(self.SCPDURL))
         else:
             try:
                 desc = ElementTree.ElementTree(ElementTree.fromstring(response.body))
@@ -118,7 +105,7 @@ class Service(UPnPObject):
             sl = desc.find(SNS('serviceStateTable'))
             if sl is not None:
                 for e in sl.findall(SNS('stateVariable')):
-                    a = StateVariable(self, e)
+                    a = StateVariable(e)
                     setattr(self, a.identifier, a)
             al = desc.find(SNS('actionList'))
             if al is not None:
@@ -126,29 +113,36 @@ class Service(UPnPObject):
                     a = Action(self, e)                    
                     setattr(self, a.identifier, a.fct)
 
-        if self._handler:
-            self._handler(self)
-
         if self.eventSubURL:
             self._subscribe()
 
-    def _action(self, action, _cb, args):
-        
-        ret = self._request(self._absurl(self.controlURL), 'POST',
-                            (lambda response:self._result(action, response, _cb)) if _cb else None,
-                            headers = {'Content-Type': 'text/xml; charset="utf-8"',
-                                       'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
-                            body=self._soapQuery(action, args))
-        if not _cb:
-            return self._action_result(action, ret, _cb)
+    def _byebye(self, lost):
+        super(Service, self)._byebye(lost)
+        self._subscription = None
+        self._statevalues = {}
 
-    def _action_result(self, action, response, cb):
+    def _action(self, action, args):
+        
+        if self._state != STATE_READY:
+            raise ActionError("Service is not ready (state=%s)" % self._state)
+       
+        import socket
+        try:
+            return self._action_result(action, 
+                                       self._request(self._absurl(self.controlURL), 'POST',
+                                                     headers = {'Content-Type': 'text/xml; charset="utf-8"',
+                                                                'SOAPAction':'"%s#%s"' % (self.serviceType, action)},
+                                                     body=self._soapQuery(action, args)))
+        except socket.error, e:
+            raise ActionError("Socket error %s", str(e).decode('latin9'))
+        except Exception, e:
+            raise ActionError("Unknown error %s", e)
+
+    def _action_result(self, action, response):        
+        response.body = response.read()
         self._logger.debug(response.body)
         ret = self._parseSoapResponse(action, response)
-        if cb:
-            cb(**ret)
-        else:
-            return ret
+        return ret
 
     def _subscribe(self):
 
@@ -161,19 +155,21 @@ class Service(UPnPObject):
         if self._subscription:
             self._subscription.unsubscribe()
 
-    def _notify(self, request):
-        if request.method != 'NOTIFY':
-            self._logger.warning('invalid method on notification path : %s', request.method)
+    def _notify(self, env, start_response):
+        if env['REQUEST_METHOD'] != 'NOTIFY':
+            self._logger.warning('invalid method on notification path : %s', env['REQUEST_METHOD'])
 
-        if request.headers.get('SID', '') != getattr(self._subscription, 'sid', None):
-            return (412,)
+        if env.get('HTTP_SID', '') != getattr(self._subscription, 'sid', None):
+            start_response(utils.status(412), [])
+            return []
         
         try:
-            body = request.body
+            body = env['wsgi.input'].read()
             body = ElementTree.fromstring(body[body.index('<'):body.rindex('>')+1])
         except ElementTree.ParseError, e:
-            self._logger.exception('Cannot parse %r', request.body)
-            return (500,)
+            self._logger.exception('Cannot parse %r', body)
+            start_response(utils.status(500), [])
+            return []
 
         stnse = self._stns("")
 
@@ -186,7 +182,9 @@ class Service(UPnPObject):
             if getattr(self, name, None) != value:
                 self._set_state_value(name, value)            
 
-        return (200,)
+        start_response(utils.status(200), [])
+        return []
+
 
     def _set_state_value(self, name, value):
         setattr(self, name, value)
@@ -210,7 +208,7 @@ class Service(UPnPObject):
         ret = {}
 
         if response.body is None:
-            raise ActionError('HTTP body not found (http : %s %s)', response.code, response.body)        
+            raise ActionError('HTTP body not found (http : %d %s)', response.status, response.reason)        
 
         body = ElementTree.fromstring(response.body).find(SQNS('Body'))
         if body is None:
@@ -227,7 +225,7 @@ class Service(UPnPObject):
             if fault is None:              
                 raise ActionError('No response found')
 
-            desc = fault.find('detail/'+CNS('UPnPError/')+CNS('errorDescription'))
+            desc = fault.find(SQNS('detail/')+CNS('UPnPError/')+CNS('errorDescription'))
             if desc is not None:
                 raise ActionError(desc.text)
 
@@ -235,7 +233,7 @@ class Service(UPnPObject):
             if fs is not None:
                 raise ActionError(fs.text)
 
-            raise ActionError("Unknown error (http : %s %s)", response.code, response.body)
+            raise ActionError("Unknown error (http : %d %s)", response.status, response.body)
 
         stnse = self._stns("")
 
@@ -250,7 +248,7 @@ class Service(UPnPObject):
 
     @property
     def USN(self):
-        return "%s::%s" % (self._parent.UDN, self.serviceType)
+        return "%s::%s" % (self.UDN, self.serviceType)
 
     @property
     def _type(self):
@@ -263,7 +261,7 @@ class Service(UPnPObject):
         return self.__stns
 
     def _match(self, ssdp):
-        return ssdp.usn == self.USN
+        return ssdp.usn == self.USN                
 
     def _absurl(self, url):
         if url.startswith('http://') or url.startswith('https://'):
@@ -275,11 +273,6 @@ class Service(UPnPObject):
 
     def __repr__(self):
         return "<%s %s %s>" % (self.__class__.__name__, self._shortType, self._absurl(self.controlURL or self.SCPDURL))
-
-    def __del__(self):
-        if self._subscription:
-            self._unsubscribe()
-        super(Service, self).__del__()
 
 class Argument(object):
     def __init__(self, service, name, related):
@@ -335,14 +328,13 @@ def %s(%s):
     """Method %s.%s
 params:
   %s
-  _cb : optionnal callback
 returns:
   %s
 """
-    return self.do_action({%s}, _cb=_cb)
+    return self.do_action({%s})
         ''' % (
             utils.normalize(self.name),
-            ", ".join(["%s=None" % p.identifier for p in params]+['_cb=None']),
+            ", ".join(["%s=None" % p.identifier for p in params]),
             self.service._shortType,
             self.name,
             "\n  ".join(p.doc() for p in params) if params else None,
@@ -360,7 +352,7 @@ returns:
             return
         return loc[self.name]
 
-    def do_action(self, args, _cb):
+    def do_action(self, args):
 
         for k, v in args.items():
             if v is None:
@@ -369,16 +361,15 @@ returns:
             if k in args and args[k] is not None and a.state_variable:
                 args[k] = a.state_variable.serialize(args[k])
 
-        return self.service._action(self.name, _cb, args)
+        return self.service._action(self.name, args)
 
 class ActionError(Exception):
     pass
 
 class StateVariable(utils.StateVariable):
 
-    def __init__(self, service, desc):
+    def __init__(self, desc):
 
-        self.service = service
         self.parse(desc)
 
     def parse(self, desc):
@@ -420,7 +411,9 @@ class Subscription(object):
     EXPIRY = 300
 
     def __init__(self, service):
-        self.service = service
+        import weakref
+        self.service = weakref.proxy(service, self.unsubscribe)
+        self.url = service._absurl(service.eventSubURL)
         self.sid = None
         self.alarm = None
         self.upnpy = service._upnpy
@@ -429,9 +422,9 @@ class Subscription(object):
     
     def subscribe(self):
 
-        if not self.upnpy._http:
+        if not self.upnpy.http:
             from http import HTTPServer
-            self.upnpy._http = HTTPServer(self.upnpy)
+            self.upnpy.http = HTTPServer(self.upnpy)
 
         headers = dict(TIMEOUT='Second-%d'%self.EXPIRY)
         if self.sid:
@@ -439,51 +432,79 @@ class Subscription(object):
         else:
             headers['NT'] = 'upnp:event'
 
-        self.service._request(self.service._absurl(self.service.eventSubURL), 'SUBSCRIBE',
-                               self._subscribed,
-                               headers=headers,
-                               on_connect=self._set_callback if not self.sid else None)
-
-    def _set_callback(self, request):
-        request.headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
-            (request.connection.getsockname()[0],
-             self.upnpy._http.server_port)       
+        req = http.HTTPRequest(self.url)
+        if not self.sid:
+            req.connect()
+            headers['CALLBACK'] = "<http://%s:%d/_notification>" % \
+                (req.sock.getsockname()[0],
+                 self.upnpy.http.server_port)       
+                   
+        up = urlparse.urlparse(self.url)
+        req.request('SUBSCRIBE',
+                    urlparse.urlunparse(('','')+up[2:]),
+                    headers=headers)
+        self._subscribed(req.getresponse())
 
     def _subscribed(self, response):
-        if response.code != '200':
+        if response.status != 200:
             if self.sid:
                 self.sid = None
                 return self.subscribe()
-            return self.service._logger.warning('subscription error : %s %s', response.code, response.status)
+            return self.service._logger.warning('subscription error : %d %s', response.status, response.reason)
         
-        self.sid = response.headers.get('SID', self.sid or None)
+        self.sid = response.getheader('SID', self.sid or None)
         if self.sid is None:
             return self.service._logger.warning('subscription error : no SID')
 
-        import weakref
-        self.upnpy._subscriptions[self.sid] = weakref.ref(self)
+        self.upnpy._subscriptions[self.sid] = self
 
-        expiry = int(response.headers.get('TIMEOUT', '-%d' % self.EXPIRY).split('-')[1])
+        expiry = int(response.getheader('TIMEOUT', '-%d' % self.EXPIRY).split('-')[1])
         if self.alarm:
-            self.upnpy.remove_alarm(self.alarm)
-        self.alarm = self.upnpy.set_alarm(self.renew, expiry/2)
+            self.alarm.kill()
 
-    def renew(self):
-        self.subscribe()
+        self.alarm = gevent.spawn_later(expiry/2, self.renew, True)
 
-    def unsubscribe(self):
-        self.upnpy.remove_alarm(self.alarm)
-        self.service._request(self.service._absurl(self.service.eventSubURL), 'UNSUBSCRIBE',
-                              self._unsubscribed,
-                              headers=dict(SID=self.sid))        
+    def renew(self, auto=False):
+        try:
+            self.subscribe()
+        except:
+            if not auto:
+                raise
 
-        self.service._subscription = None        
+    def unsubscribe(self, arg=None):
+        if self.alarm:
+            self.alarm.kill()
+
+        self.upnpy._subscriptions.pop(self.sid, None)
+
+        import socket
+        try:            
+            req = http.HTTPRequest(self.url)
+            up = urlparse.urlparse(self.url)
+            req.request('UNSUBSCRIBE',
+                        urlparse.urlunparse(('','')+up[2:]),
+                        headers=dict(SID=self.sid))
+            self._unsubscribed(req.getresponse())
+
+        except socket.error:
+            pass
+
+        self.sid = None
+
+        try:
+            self.service._subscription = None        
+        except ReferenceError:
+            pass
 
     def _unsubscribed(self, response):
         pass
 
-    def notify(self, request):
-        return self.service._notify(request)    
+    def notify(self, env, start_response):
+        try:
+            return self.service._notify(env, start_response)    
+        except ReferenceError:
+            start_response(utils.status(404), [])
+            return []
 
 class Device(UPnPObject):
 
@@ -491,7 +512,7 @@ class Device(UPnPObject):
             'modelName', 'modelNumber', 'modelURL', 'serialNumber', 'UDN', 'UPC', 'presentationURL']
     
     def __init__(self, upnpy, location, parent=None, desc=None, handler=None, service_class=None, device_class=None):
-        super(Device, self).__init__(upnpy, location, parent, handler)
+        super(Device, self).__init__(upnpy, location)
 
         self._service_class = service_class or Service
         self._device_class = device_class or self.__class__
@@ -499,26 +520,23 @@ class Device(UPnPObject):
         self.services = {}
         self.devices = {}
 
-        from http import ConnectionManager
-        self._conm = None if parent else ConnectionManager(upnpy)
+        self._root = parent is None
 
-        if desc:
-            self._parse(desc)
-        else:
-            self._describe()
+        self._parse(desc or self._describe(self._location), handler)
 
-    def _describe(self):
-        self._do_describe(self._location,
-                          self._parse)
+        self._state = STATE_READY
 
-    def _parse(self, description):
+        if handler:
+            handler(self)
+
+    def _parse(self, description, handler):
 
         desc = None
 
         if hasattr(description, 'makeelement'): #check if Element
             desc = description
-        elif description.code != '200' or not description.body:
-            self._logger.error('cannot access device description : %s %s at %s', description.code, description.status, self._location)
+        elif description.status != 200 or not description.body:
+            self._logger.error('cannot access device description : %d %s at %s', description.status, description.reason, self._location)
         else:
             try:
                 desc = ElementTree.ElementTree(ElementTree.fromstring(description.body)).find(DNS('device'))
@@ -535,7 +553,7 @@ class Device(UPnPObject):
         self._logger = logging.getLogger('device.%s' % (self.friendlyName,))
             
         for d in desc.findall(DNS('deviceList/')+DNS('device')):
-            device = self._device_class(self._upnpy, self._location, parent=self, desc=d, handler=self._handler)
+            device = self._device_class(self._upnpy, self._location, parent=self, desc=d, handler=handler)
             self.devices[device.deviceType] = device
             if len(device.deviceType.split(':')) <= 3:
                 continue            
@@ -544,14 +562,11 @@ class Device(UPnPObject):
                 setattr(self, short, device)
                 
         for s in desc.findall(DNS('serviceList/')+DNS('service')):
-            service = self._service_class(self._upnpy, self._location, parent=self, desc=s, handler=self._handler)            
+            service = self._service_class(self._upnpy, self._location, desc=s, parent=self, handler=handler)            
             self.services[service.serviceType] = service
 
             if not hasattr(self, service._shortType):
                 setattr(self, service._shortType, service)
-
-        if self._handler:
-            self._handler(self)        
                
     @property
     def USN(self):
@@ -562,37 +577,52 @@ class Device(UPnPObject):
         return self.deviceType
 
     def _match(self, ssdp):
-        return (ssdp.type == 'upnp:rootdevice' and not self._parent) \
-            or ssdp.usn == self.USN \
-            or ssdp.usn == self.UDN
+        return ( ssdp.usn == self.USN
+                     or ( ssdp.usn == self.UDN and self._root) #some subdevices share UDN with parent
+                     or ( ssdp.usn == ('%s::upnp:rootdevice' % self.UDN) and self._root))
 
     def __repr__(self):
-        fn = self.friendlyName
-        if isinstance(fn, unicode):
-            fn = utils.unormalize(fn)
+        try:
+            fn = self.friendlyName
+            if isinstance(fn, unicode):
+                fn = utils.unormalize(fn)
+        except AttributeError:
+            fn="unknown device"
         return "<%s %s %s>" % (self.__class__.__name__, fn, self._location)
-
-    def _clean(self):
-        if self._conm:
-            self._conm.clean()
 
 class BaseDiscoveryHandler(object):
 
     def __init__(self, upnpy, device_class=Device):
         self.device_class = device_class
         self.upnpy = upnpy
+        self.logger = logging.getLogger(self.__class__.__name__)
         
     def match(self, ssdp):
         return True
 
     def create(self, ssdp):
-        return self.device_class(self.upnpy, ssdp.headers.get('SECURELOCATION.UPNP.ORG', ssdp.headers['LOCATION']),
-                                 handler=lambda o:self._created(o, ssdp))
+        errors = dict()
+        for l in list(ssdp.headers.get('SECURELOCATION.UPNP.ORG', [])) + list(ssdp.headers['LOCATION']):
+            import socket
+            try:
+                return self.device_class(self.upnpy, l, 
+                                         handler=lambda o:self._created(o, ssdp))
+            except socket.error, e:
+                errors[l] = e
+                self.logger.error("%s for description at %s", e, l)
+            #except Exception, e:
+            #    errors[l] = e
+            #    self.logger.exception("%s for description at %s", e, l)
+
+        raise LookupError(", ".join("%s => %s" % le for le in errors.items()))
 
     def _created(self, obj, ssdp):
+
+        for e in self.upnpy.ssdp._seen.values():
+            if obj._match(e):
+                e.devices.add(obj)
+
         if obj._match(ssdp):
-            import weakref
-            ssdp.devices.append(weakref.ref(obj))
             self.handle(obj)
 
     def handle(self, obj):
@@ -615,13 +645,13 @@ class SearchHandler(BaseDiscoveryHandler):
 
         self.target = target
         self.matches = []
-        self.upnpy._ssdp.msearch(self.target, timeout/2.0)
+        self.upnpy.ssdp.msearch(self.target, timeout/2.0)
 
     def match(self, ssdp):
         #logging.info('match %s ? %s', self.target, ssdp)
         if self.target in ['ssdp:all',
-                         ssdp.type,
-                         ssdp.usn]:
+                           ssdp.type,
+                           ssdp.usn]:
             return True
 
     def handle(self, devser):

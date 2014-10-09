@@ -10,10 +10,14 @@ import sys
 sys.path += ['.']
 
 import upnpy
-WCSTYPE = 'urn:schemas-upnp-org:service:WANIPConnection:1'
+WCSTYPE1 = 'urn:schemas-upnp-org:service:WANIPConnection:1'
+WCSTYPE2 = 'urn:schemas-upnp-org:service:WANIPConnection:2'
 
 def GetExternalIPAddress():    
-    return upnpy.Upnpy().get(WCSTYPE).GetExternalIPAddress()['NewExternalIPAddress']
+    try:
+        return upnpy.Upnpy().get(WCSTYPE1).GetExternalIPAddress()['NewExternalIPAddress']
+    except KeyError:
+        return upnpy.Upnpy().get(WCSTYPE2).GetExternalIPAddress()['NewExternalIPAddress']
 
 def test():
     print 'ExternalIPAddress:', GetExternalIPAddress()

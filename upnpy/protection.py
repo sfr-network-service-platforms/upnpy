@@ -179,31 +179,8 @@ class Service(BaseService):
     def RemoveRolesForIdentity(self, Identity, RoleList):
         return
 
-
-    def _handle_request(self, request, devser):
-                
-        rp = request.protection = RequestProtection()
-
-        try:            
-            cert = ussl.get_peer_certificate(request.connection.socket)
-            #user = None #so.get_context().get_app_data()
-        except AttributeError:
-            pass
-        else:
-            if cert:
-                cp = ControlPoint.get(
-                    ussl.cert_uuid(cert),
-                    cert.get_subject().CN)
-                self._logger.debug("control point : %s", cp)
-                rp.identities.append(cp)
-
-        for i in rp.identities:
-            rp.roles |= i.roles
-
-    def _check_acl(self, request, service, action):
+    def _check_acl(self, env, service, action):
        
-        rp = request.protection
-
         if getattr(action, 'roles', None) or getattr(action, 'restricted_roles', None):
             required = action.roles or Roles()
             restricted_roles = action.restricted_roles or Roles()
@@ -211,14 +188,13 @@ class Service(BaseService):
             required = Roles(['Public'])
             restricted_roles = Roles()
         
-        if rp.roles.isdisjoint(required | restricted_roles):
-            raise ACLError(detail="roles '%s' neither in required '%s' nor in restricted '%s'" % (rp.roles, required, restricted_roles))
+        if env['upnp.dp.roles'].isdisjoint(required | restricted_roles):
+            raise ACLError(detail="roles '%s' neither in required '%s' nor in restricted '%s'" % (env['upnp.dp.roles'], required, restricted_roles))
                            
 class RequestProtection(object):
     def __init__(self):
         self.identities = []
         self.roles = Roles(['Public'])
-
 
 class Identity(object):
     CLASSES = []
@@ -307,3 +283,31 @@ class ControlPoint(Identity):
             return [db[key] for key in db if key.startswith('controlpoint.')]
 
 Identity.CLASSES.append(ControlPoint)
+
+
+def get_identities_roles(env, der=None, cn=None):
+        
+    rp = RequestProtection()
+
+    if der:
+        cp = ControlPoint.get(cert_uuid(der), cn)
+        #logging.debug("control point : %s", cp)
+        rp.identities.append(cp)
+            
+    for i in rp.identities:
+        rp.roles |= i.roles
+
+    return rp.identities, rp.roles
+
+
+from uuid import UUID
+NAMESPACE_CERT = UUID('acf2b7b8-ba52-4ccb-8484-67c7d17e98bf')
+
+def cert_uuid(der):
+    """Generate a UUID from the SHA-256 hash of a certificate."""
+
+    #cf uuid.py
+    from hashlib import sha256
+    hash = sha256(NAMESPACE_CERT.bytes + der).digest()
+
+    return UUID(bytes=hash[:16], version=5)    

@@ -10,6 +10,10 @@ try:
 except:
     from xml.etree import ElementTree
 
+def status(code):
+    from BaseHTTPServer import BaseHTTPRequestHandler
+    return "%d %s" % (code, BaseHTTPRequestHandler.responses.get(code, '???')[0])
+
 class Namespace(object):
     """a namespace helper, a la xml.etree.ElementTree.QName, with theses added features:
     - the namespace is registered if a prefix is given

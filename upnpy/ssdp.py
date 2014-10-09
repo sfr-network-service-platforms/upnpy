@@ -6,264 +6,38 @@ __copyright__ = 'Copyright (c) 2014 SFR (http://www.sfr.com)'
 __license__ = 'GNU LESSER GENERAL PUBLIC LICENSE Version 2.1'
 
 import http
-import asynchat, asyncore
-import time, socket
+import time, socket, sys
 import logging
+import gevent, gevent.pywsgi
+import httplib, mimetools
 
-from errno import EALREADY, EINPROGRESS, EWOULDBLOCK, ECONNRESET, EINVAL, \
-     ENOTCONN, ESHUTDOWN, EINTR, EISCONN, EBADF, ECONNABORTED, EPIPE, EAGAIN, \
-     errorcode
+try:
+    import cStringIO as StringIO
+except:
+    import StringIO
 
-#object to request new-style for super
-class SSDPServer(object):
+EXPIRY = 1800
 
-    PORT = 1900
-    MIP = '239.255.255.250'
-    MIPv6 = '239.255.255.250'
+class SSDPHandler(object):
 
-    REPLIES = 3
-
-    def __init__(self, upnpy, *args, **kwargs):
-
-        self.upnpy = upnpy
-
-        self._seen = {}
-        self._handlers = []
-        self._advertisement = dict()
-        
-        self._iface_servers = []
-
-        if upnpy.server_address:
-            self._iface_servers.append(SSDPSingleServer(self, upny.server_address))
-            self._any_server = self._iface_servers[0]
-        else:
-            import ifaces
-            for i, a in ifaces.get_addrs(ifaces.AF_INET):
-                if i == 'lo': continue
-                self._iface_servers.append(SSDPSingleServer(self, a, self.PORT))
-
-            self._any_server = SSDPSingleServer(self, '0.0.0.0', self.PORT)
-
-        self._emit_server = SSDPSingleServer(self, '0.0.0.0', 0)
-                           
-    def msearch(self, type, mx=5.0):
-        self._emit_server.msearch(type, mx)
-
-    def advertise(self, devser):
-
-        self._advertise(devser, devser._type, devser.USN)
-
-        #for device
-        if 'UDN' in devser._ATTRS:
-            self._advertise(devser, devser.UDN, devser.UDN)
-
-        #for root
-        if not devser._parent:
-            self._advertise(devser, "upnp:rootdevice", "%s::upnp:rootdevice" % devser.UDN)
-
-    def _advertise(self, devser, type, usn):
-
-        headers = http.Headers(LOCATION=devser._location)
-        if devser._protection:
-            headers['SECURELOCATION.UPNP.ORG'] = devser._location
-
-        e = SSDPEntry(usn,
-                      type,
-                      headers,
-                      devser.EXPIRY,
-                      None)
-        self._notify(e, 'alive')
-
-    def withdraw(self, devser):
-
-        self._withdraw(devser, devser._type, devser.USN)
-
-        #for device
-        if 'UDN' in devser._ATTRS:
-            self._withdraw(devser, devser.UDN, devser.UDN)
-
-        #for root
-        if not devser._parent:
-            self._withdraw(devser, "upnp:rootdevice", "%s::upnp:rootdevice" % devser.UDN)
-
-    def _withdraw(self, devser, type, usn):
-
-        headers = http.Headers(LOCATION=devser._location)
-        if devser._protection:
-            headers['SECURELOCATION.UPNP.ORG'] = devser._location
-
-        e = SSDPEntry(usn,
-                      type,
-                      headers,
-                      devser.EXPIRY,
-                      None)
-
-        if e not in self._advertisement:
-            return
-
-        self._notify(e, 'byebye')
-             
-    def _notify(self, ssdp, activity):
-        
-        for s in self._iface_servers:
-            s.notify(ssdp, activity)
-
-            #     self._msend(s, 'NOTIFY', '*', dict({
-        #                 'NT' : ssdp.type,
-        #                 'USN' : ssdp.usn,
-        #                 'NTS' : 'ssdp:%s'%activity,
-        #                 'LOCATION' : s._url(ssdp.location),
-        #                 'CACHE-CONTROL' : 'max-age=%d' % ssdp.expiry,
-        #                 'SERVER':SSDPMessage.version_string()
-        #                 }, **({'SECURELOCATION.UPNP.ORG':s._url(ssdp.seclocation, True)} if ssdp.seclocation else {}))
-        #                 )
-                    
-        if activity == 'alive':
-            self._advertisement[ssdp] = self.upnpy.set_alarm(lambda:self._notify(ssdp, 'alive'), ssdp.expiry/3)
-        elif ssdp in self._advertisement:
-            self.upnpy.remove_alarm(self._advertisement[ssdp])
-            
-    def _periodic(self):
-        for a, t in self._advertisement.items():
-            if t+a.expiry/2 < time.time():
-                self._notify(a, 'alive')
-
-        self._advertisement[ssdp] = time.time()
-
-    # def _msend(self, server, method, path, headers, body=None):
-    #     SSDPMessage(method=method,
-    #                 path=path,
-    #                 headers=headers,
-    #                 body=body,
-    #                 to=(self.MIP, self.PORT)).dump(server.socket)
-
-    def alive(self, usn, type, headers, expiry):
-
-        entry = SSDPEntry(usn, type, headers, expiry,
-                          filter(lambda d:d(), self._seen[usn].devices) if usn in self._seen else [])
-            
-        if usn not in self._seen:
-            for h in self._handlers:
-                if h.match(entry):
-                    h.create(entry)
-
-        self._seen[usn] = entry
-
-    def byebye(self, usn):
-        entry = self._seen.pop(usn, None)        
-        if entry:
-            for d in entry.devices:
-                o = d()
-                if o:
-                    o._byebye()
-
-    def _expire(self):
-        now = time.time()
-
-        for usn, entry in self._seen.items():
-            if now > entry.expiry: 
-                self.byebye(usn)
-
-    def add_handler(self, handler):
-
-        self._expire()
-
-        self._handlers.append(handler)
-
-        for usn, entry in self._seen.items():
-            if handler.match(entry):
-                handler.create(entry)
-
-    def remove_handler(self, handler):
-
-        self._handlers.remove(handler)
-
-    def clean(self):
-        for usn in self._seen.keys():
-            self.byebye(usn)
-        self._handlers = []
-
-class SSDPRequest(http.HTTPRequest):
-
-    def parse_requestline(self):
-        
-        rl = self.firstline.split(None, 2) 
-        if len(rl) != 3:
-            return self.respond(400, "Bad request syntax (%r)" % self.firstline)
-
-        if rl[2].startswith('HTTP/'):
-            self.method, self.path, self.request_version = rl
-        elif rl[0].startswith('HTTP/'):
-            self.request_version, self.method, self.status = rl
-        else:
-            return self.respond(400, "Bad request syntax (%r)" % self.firstline)
-
-    def adjust_headers(self):
-        self.headers.set_if_unset('User-Agent', self.version_string())
-
-    def respond(self, *args, **kwargs):
-        http.HTTPRequest.respond(self, *args, **kwargs)
-        self.response = None #allow multiple responses for a single request
-
-class SSDPResponse(http.HTTPResponse):
-
-    def adjust_headers(self):
-        self.headers.set_if_unset('SERVER', self.version_string())
-
-import collections
-SSDPEntry = collections.namedtuple('SSDPEntry', 'usn type headers expiry devices')
-
-class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
-
-    PROTO = socket.SOL_UDP
-
-    def __init__(self, server, address, port, interface=None):
-
+    def __init__(self, server):
         self.server = server
-        self.address = address
-        self.port = port
-        self.interface = interface
-
-        http.LoggedDispatcher.__init__(self)
-        asyncore.dispatcher_with_send.__init__(self, map=server.upnpy._map)
-
-        self.out_buffer = []
-
-        self.create_socket()#socket.AF_INET, socket.SOCK_DGRAM)
-        self.set_reuse_addr()
-
-        if port:
-            #print "bind", (self.server.MIP if address != '0.0.0.0' else address, port)
-            self.bind((self.server.MIP if address != '0.0.0.0' else address, port))
+        self.logger = logging.getLogger('ssdp')        
         
-        if address != '0.0.0.0':
-            self.join_multicast()
+    def __call__(self, env, start_response):
 
-    def create_socket(self):
-        family, socktype = socket.getaddrinfo(
-            self.address, self.port, 0, 0, self.PROTO)[0][:2]
-        asyncore.dispatcher_with_send.create_socket(self, family, socktype)
-
-    def join_multicast(self):
-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                               socket.inet_aton(self.server.MIP) + socket.inet_aton(self.address))
-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                               socket.inet_aton(self.address))            
-
-    def handle_request(self, request):
-        method = getattr(self, 'do_'+request.method.replace('-', '_'), None)
+        method = getattr(self, 'do_'+env['REQUEST_METHOD'].replace('-', '_'), None)
         if callable(method):
-            method(request)
+            return method(env, start_response)
         else:
-            self.logger.error("unhandled method %s", request.method)
+            self.logger.error("unhandled method %s", env['REQUEST_METHOD'])
+            return []
             
-    def do_M_SEARCH(self, request):
-        if self.address == '': return
-        if request.headers.get('MAN', None) != '"ssdp:discover"': return
-        st = request.headers.get('ST',None)
-        #print self.address
-        for a in self.server._advertisement:
+    def do_M_SEARCH(self, env, start_response):
+        if env.get('HTTP_MAN', None) != '"ssdp:discover"': return []
+        st = env.get('HTTP_ST',None)
+        #print self.server.address
+        for a in self.server.server._advertisement.values():
             if st in ['ssdp:all',
                       a.type,
                       a.usn]:
@@ -277,43 +51,320 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
                         'CACHE-CONTROL':'max-age=%d' % a.expiry,
                         'EXT': ''})
                 #modify location headers (host computed at send time)
-                for k in ['LOCATION', 'SECURELOCATION.UPNP.ORG']:
+                for k, secure in {'LOCATION':False, 'SECURELOCATION.UPNP.ORG':True}.items():
                     if k in a.headers:
-                        headers[k] = self._url(a.headers[k], True)
-                request.respond(200, headers=headers)
+                        headers[k] = self.server._url(a.headers[k], secure)
+                start_response('200 OK', headers.items())
+        return []
 
-    def do_NOTIFY(self, request):
-        activity = request.headers.get('NTS',':').split(':')[1]
-        usn = request.headers.get('USN',None)
+    def do_NOTIFY(self, env, start_response):
+        #print env
+        activity = env.get('HTTP_NTS',':').split(':')[1]
+        usn = env.get('HTTP_USN',None)
         if activity in ['alive', 'update']:
             expiry = time.time()
+            headers = dict()
+            for k, v in env.items():
+                if k.startswith('HTTP_'):
+                    headers[k[5:]] = v
+            #self.logger.debug('NOTIFY %s %s', usn, headers['LOCATION'])
             try:
-                expiry += int(request.headers.get('Cache-Control', '=1800').split('=')[1])
+                expiry += int(env.get('HTTP_CACHE_CONTROL', '=%d' % EXPIRY).split('=')[1])
             except:
-                expiry += 1800            
-            self.server.alive(
+                expiry += EXPIRY            
+            self.server.server.alive(
                 usn,
-                request.headers.get('NT', None),
-                request.headers,
+                env.get('HTTP_NT', None),
+                headers,
                 expiry
                 )
         elif activity == 'byebye':
-            self.server.byebye(usn)
+            self.server.server.byebye(usn)
         else:
             self.logger.error("NOTIFY : unhandled NTS %s", activity)
 
-    def do_200(self, request):
-        expiry = time.time()
+        return []
+
+#object to request new-style for super
+class SSDPServer(object):
+
+    PORT = 1900
+    MIP = '239.255.255.250'
+    MIPv6 = '239.255.255.250'
+
+    def __init__(self, upnpy, *args, **kwargs):
+
+        self.upnpy = upnpy
+        self.logger = logging.getLogger('ssdp')        
+
+        self._seen = {}
+        import weakref
+        self._handlers = weakref.WeakSet()
+        self._advertisement = {}
+        
+        self._iface_servers = []
+
+        if upnpy.server_address:
+            self._iface_servers.append(SSDPSingleServer(self, upny.server_address))
+            #self._any_server = self._iface_servers[0]
+        else:
+            import ifaces
+            for i, a in ifaces.get_addrs(ifaces.AF_INET):
+                #if i == 'lo': continue
+                self._iface_servers.append(SSDPSingleServer(self, a))
+
+            #self._any_server = SSDPSingleServer(self, ('0.0.0.0', self.PORT))
+
+        #print map(lambda s:s.address, self._iface_servers)#+[self._any_server])
+                           
+    def msearch(self, type, mx=5.0):
+        responses = self.send_request((self.MIP, self.PORT), 'M-SEARCH', '*',
+                                      headers=dict(MAN='"ssdp:discover"',
+                                                   MX="%d" % mx,
+                                                   ST=type),
+                                      timeout=mx)
+
+        for r in responses:
+            expiry = time.time()
+            try:
+                expiry += int(r.getheader('Cache-Control', '=%d' % EXPIRY).split('=')[1])
+            except:
+                expiry += EXPIRY    
+            self.alive(
+                r.getheader('USN',None),
+                r.getheader('ST', None),
+                dict(map(lambda kv: (kv[0].upper(), kv[1]), r.getheaders())),
+                expiry
+                )
+
+    def send_request(self, to, method, path, headers=None, body=None, timeout=0):
+        req = SSDPConnection(to[0], to[1], timeout=timeout)
+        #req.set_debuglevel = 9
+        req.request(method, path, body, headers)
+
+        return req.getresponses()
+
+    def advertise(self, devser):
+
+        self._advertise(devser, devser.USN, devser._type)
+
+        #for device
+        if 'UDN' in devser._ATTRS:
+            self._advertise(devser, devser.UDN, devser.UDN)
+
+        #for root
+        if not devser._parent:
+            self._advertise(devser, "%s::upnp:rootdevice" % devser.UDN, "upnp:rootdevice")
+
+    def _advertise(self, devser, usn, type):
+
+        headers = dict(LOCATION=devser._location)
+        if devser._protection:
+            headers['SECURELOCATION.UPNP.ORG'] = devser._location
+
+        e = SSDPEntry(usn,
+                      type,
+                      headers,
+                      devser.EXPIRY,
+                      None)
+        self._notify(e, 'alive')
+
+    def withdraw(self, devser):
+
+        self._withdraw(devser, devser.USN, devser._type)
+
+        #for device
+        if 'UDN' in devser._ATTRS:
+            self._withdraw(devser, devser.UDN, devser.UDN)
+
+        #for root
+        if not devser._parent:
+            self._withdraw(devser, "%s::upnp:rootdevice" % devser.UDN, "upnp:rootdevice")
+
+    def _withdraw(self, devser, usn, type):
+
+        headers = dict(LOCATION=devser._location)
+        if devser._protection:
+            headers['SECURELOCATION.UPNP.ORG'] = devser._location
+
+        e = SSDPEntry(usn,
+                      type,
+                      headers,
+                      devser.EXPIRY,
+                      None)
+
+        if (usn, type) not in self._advertisement:
+            return
+
+        self._notify(e, 'byebye')
+             
+    def _notify(self, ssdp, activity):
+        
+        for s in self._iface_servers:
+            s.notify(ssdp, activity)
+                   
+        key = (ssdp.usn, ssdp.type)
+
+        if activity == 'alive':
+            self._advertisement[key] = SSDPEntry(ssdp.usn, ssdp.type, ssdp.headers, ssdp.expiry, gevent.spawn_later(ssdp.expiry/3, self._notify, ssdp, 'alive'))
+
+        elif key in self._advertisement:
+            self._advertisement[key].devices.kill()
+            del self._advertisement[key]
+            
+    def alive(self, usn, type, headers, expiry):
+
+        new = usn not in self._seen
+
+        import weakref
+        entry = SSDPEntry(usn, type, headers, expiry, 
+                          weakref.WeakSet() if new else self._seen[usn].devices)
+
+        #merge and listify locations headers
+        for h in ['LOCATION', 'SECURELOCATION.UPNP.ORG']:
+            l = set()
+            if h in entry.headers:
+                l.add(entry.headers[h])
+            if usn in self._seen and h in self._seen[usn].headers:
+                l |= self._seen[usn].headers[h]
+            if l:
+                entry.headers[h] = l
+       
+        self._seen[usn] = entry
+
+        if new:
+            for h in self._handlers:
+                if h.match(entry):
+                    try:
+                        h.create(entry)              
+                    except Exception, e:
+                        self.logger.error('cannot access device %s', e)
+
+        gevent.spawn_later(2*(expiry-time.time()), self._mayexpire, usn)
+
+    def _mayexpire(self, usn):
+
+        if usn in self._seen and self._seen[usn].expiry < time.time():
+            self.byebye(usn, True)
+
+    def byebye(self, usn, lost=False):        
+        entry = self._seen.pop(usn, None)        
+        if entry:
+            #self.logger.info("byebye %s%s devices %s", "lost " if timeout else "", usn, entry.devices)
+            for d in entry.devices:
+                if d._state != "byebye":
+                    d._byebye(lost)
+
+    def add_handler(self, handler):
+
+        self._handlers.add(handler)       
+
+        for usn, entry in self._seen.items():
+            if handler.match(entry):
+                try:
+                    handler.create(entry)              
+                except Exception, e:
+                    self.logger.error('cannot access device %s', e)
+
+    def clean(self):
+        for usn in self._seen.keys():
+            self.byebye(usn)
+        self._handlers = []
+
+    def info(self):
+        print "\n".join("%i %s (%s)" % (e.expiry, e.usn, ",".join(e.headers['LOCATION'] | e.headers.get('SECURELOCATION.UPNP.ORG', set()))) for e in sorted(self._seen.values(), key=lambda e:e.usn))
+
+class WSGIHandler(gevent.pywsgi.WSGIHandler):
+    protocol_version = 'HTTP/1.1'
+    MessageClass = mimetools.Message
+
+    import upnpy
+    import sys
+    SERVER_HEADER = ('Server', 'Upnpy/%s, UPnP/%s, Python/%s' % (upnpy.__version__, upnpy.UPNP_VERSION, sys.version.split()[0]))
+
+    def __init__(self, data, address, server, rfile=None):
+        self.client_address = address
+        self.server = server
+        self.rfile = StringIO.StringIO(data)
+        self.socket = PseudoConnectedSocket(address, server.socket)
+
+    def handle(self):
         try:
-            expiry += int(request.headers.get('Cache-Control', '=1800').split('=')[1])
-        except:
-            expiry += 1800            
-        self.server.alive(
-            request.headers.get('USN',None),
-            request.headers.get('ST', None),
-            request.headers,
-            expiry
-            )
+            while self.socket is not None:
+                self.time_start = time.time()
+                self.time_finish = 0
+                result = self.handle_one_request()
+                if result is None:
+                    break
+                if result is True:
+                    continue
+                self.status, response_body = result
+                self.socket.sendall(response_body)
+                if self.time_finish == 0:
+                    self.time_finish = time.time()
+                self.log_request()
+                break
+        finally:
+            #if self.socket is not None:
+            #    try:
+                    # read out request data to prevent error: [Errno 104] Connection reset by peer
+            #        try:
+            #            self.socket._sock.recv(16384)
+            #        finally:
+            #            pass
+                        #self.socket._sock.close()  # do not rely on garbage collection
+                        #self.socket.close()
+            #    except socket.error:
+            #        pass
+            self.__dict__.pop('socket', None)
+            self.__dict__.pop('rfile', None)
+
+    def finalize_headers(self):
+        super(WSGIHandler, self).finalize_headers()
+        self.response_headers.append(self.SERVER_HEADER)
+
+    def log_request(self):
+        pass
+
+        
+class SSDPSingleServer(gevent.server.DatagramServer, gevent.pywsgi.WSGIServer):
+
+    handler_class = WSGIHandler
+    PROTO = socket.SOL_UDP
+
+    def __init__(self, server, if_address, backlog=None, spawn='default', log='default', handler_class=None, environ=None):
+
+        self.server = server
+        self.if_address = if_address
+
+        self.environ = dict(SERVER_NAME='ssdp')
+
+        gevent.server.DatagramServer.__init__(self, (server.MIP, server.PORT))
+
+        self.application =  SSDPHandler(self)
+        if handler_class is not None:
+            self.handler_class = handler_class
+        self.log=http.FileLogger('ssdp')
+        self.set_environ(environ)
+        self.set_max_accept()
+        self.start()        
+
+    def init_socket(self):
+        gevent.server.DatagramServer.init_socket(self)
+        self.join_multicast()
+        self.update_environ()
+
+    def join_multicast(self):
+        #print "multicast", self.address
+        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                               socket.inet_aton(self.server.MIP) + socket.inet_aton(self.if_address))
+        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                               socket.inet_aton(self.if_address))
+
+    @property
+    def ssl_enabled(self):
+        return False
 
     def notify(self, ssdp, activity):
 
@@ -325,161 +376,166 @@ class SSDPSingleServer(http.LoggedDispatcher,asyncore.dispatcher_with_send):
                  'NTS': 'ssdp:%s' % activity,
                  'CACHE-CONTROL': 'max-age=%d' % ssdp.expiry}
         #modify location headers (host computed at send time)
-        for k in ['LOCATION', 'SECURELOCATION.UPNP.ORG']:
+        for k, secure in {'LOCATION':False, 'SECURELOCATION.UPNP.ORG':True}.items():
             if k in ssdp.headers:
-                headers[k] = self._url(ssdp.headers[k], True)
+                headers[k] = self._url(ssdp.headers[k], secure)
         self.send_request((self.server.MIP, self.server.PORT), 'NOTIFY', '*', headers=headers)
 
-    def msearch(self, type, mx):
-        self.send_request((self.server.MIP, self.server.PORT), 'M-SEARCH', '*',
-                          headers=dict(MAN='"ssdp:discover"',
-                                       MX="%d" % mx,
-                                       ST=type))
-        #for s in self._iface_servers:
-        #    self._msend(s, 'M-SEARCH', '*',
-        #                dict(MAN='"ssdp:discover"', MX=int(mx), ST=type))
-        #, 'M-SEARCH', '*',
-        #            dict(MAN='"ssdp:discover"',
-        #                 MX=int(mx),
-        #                 ST=type))
-
     def send_request(self, to, method, path, headers=None, body=None):
-        conn = SSDPClientConnection(self, to)
-        request = conn.REQUEST_CLASS(
-            method=method,
-            path=path,
-            headers=http.Headers({
-                    'HOST':'%s:%d' % to},
-                                 **(headers or {})),
-            body=body,
-            )
-        conn.send_request(request)         
-
-    def handle_read(self):
-        data, addr = self.recv(4096)
-        if data:
-            try:
-                SSDPServerConnection(self, addr, data)
-            except Exception, e:
-                from asyncore import compact_traceback
-                nil, t, v, tbinfo = compact_traceback()
-
-                self.log_info(
-                    'error handling SSDP packet %r (%s:%s %s)' % (
-                        data,
-                        t,
-                        v,
-                        tbinfo
-                        ),
-                    'error'
-                    )
-
-    def recv(self, buffer_size):
-        try:
-            data = self.socket.recvfrom(buffer_size)
-            if not data:
-                # a closed connection is indicated by signaling
-                # a read condition, and having recv() return 0.
-                return (None, None)
-            else:
-                return data
-        except socket.error, why:
-            # winsock sometimes raises ENOTCONN
-            if why.args[0] in asyncore._DISCONNECTED:
-                return ''
-            elif why.args[0] in (asyncore.EAGAIN,):
-                return (None, None)
-            else:
-                raise 
-
-    def writable(self):
-        return self.connected and len(self.out_buffer)
-
-    def send(self, data, to):
-        if self.debug:
-            self.log_info('sending %s to %s' % (repr(data), repr(to)))
-        self.out_buffer.append((data, to))
-        self.initiate_send()    
-        return len(data)
-
-    def initiate_send(self):
-        if len(self.out_buffer):
-            self.send_buffered(*self.out_buffer.pop(0))
-
-    def send_buffered(self, data, to):
-        try:
-            result = self.socket.sendto(data, to)
-            return result
-        except socket.error, why:
-            if why.args[0] == EWOULDBLOCK:
-                return 0
-            elif why.args[0] in (ECONNRESET, ENOTCONN, ESHUTDOWN, ECONNABORTED):
-                self.handle_close()
-                return 0
-            else:
-                raise
-
-    def handle_close(self):
-        pass
-
+        req = SSDPConnection(to[0], to[1], socket=self.socket)
+        req.request(method, path, body, headers)
+        
     def _url(self, path, secure=False):
         return 'http%s://%s:%d%s' % (
             's' if secure else '',
-            self.address,
-            self.server.upnpy._https.server_port if secure else self.server.upnpy._http.server_port,
+            self.if_address,
+            self.server.upnpy.https.server_port if secure else self.server.upnpy.http.server_port,
             path)
 
-class _SSDPConnection(http._HTTPConnection):
+import collections
+SSDPEntry = collections.namedtuple('SSDPEntry', 'usn type headers expiry devices')
+
+class PseudoConnectedSocket(object):
+    def __init__(self, client, sock):
+        self.socket = sock
+        self.client = client
+
+    def __getattr__(self, key):
+        #print "getattr", key
+        return getattr(self.socket, key)
+
+    def makefile(self, mode, bufsize):
+        if 'r' in mode:
+            return StringIO.StringIO(self.socket.recvfrom(bufsize or 65536)[0])
+
+    def sendall(self, data, flags=None):
+        return self.socket.sendto(data, self.client) if flags is None else self.socket.sendto(data, flags, self.client)
+    send = sendall
     
-    REQUEST_CLASS = SSDPRequest
-    RESPONSE_CLASS = SSDPResponse
+    #def close_nop(self):
+    #    pass
 
-    def set_idle_handler(self):
-        pass
-    
-    def getsockname(self):
-        return self.server.socket.getsockname()
+class SSDPConnection(httplib.HTTPConnection):
 
-    def send(self, data):
-        return self.server.send(data, self.remote_address)       
+    import upnpy
+    import sys
+    USER_AGENT = ('User-Agent', 'Upnpy/%s, UPnP/%s, Python/%s' % (upnpy.__version__, upnpy.UPNP_VERSION, sys.version.split()[0]))
 
-    def add_channel(self, sock, map=None):
-        #socket already in map
-        pass
+    def __init__(self, host, port=None, socket=None, strict=None,
+                 timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+
+        httplib.HTTPConnection.__init__(self, host, port, strict, timeout, source_address)
+        if socket:
+            self.auto_open = False
+            socket = PseudoConnectedSocket((host, port), socket)
+
+        self.sock = socket
+
+        self._create_connection = self._create_pseudo_connection
+        
+    def putrequest(self, method, url, skip_host=0, skip_accept_encoding=0):
+        """Send a request to the server.
+
+        `method' specifies an HTTP request method, e.g. 'GET'.
+        `url' specifies the object being requested, e.g. '/index.html'.
+        `skip_host' if True does not add automatically a 'Host:' header
+        `skip_accept_encoding' if True does not add automatically an
+           'Accept-Encoding:' header
+        """
+        httplib.HTTPConnection.putrequest(self, method, url, skip_host, 1)
+        self.putheader(*self.USER_AGENT)
+
+    def getresponses(self, buffering=False):
+        "Get the response from the server."
+
+        # if a prior response has been completed, then forget about it.
+        if self._HTTPConnection__response and self._HTTPConnection__response.isclosed():
+            self._HTTPConnection__response = None
+
+        #
+        # if a prior response exists, then it must be completed (otherwise, we
+        # cannot read this response's header to determine the connection-close
+        # behavior)
+        #
+        # note: if a prior response existed, but was connection-close, then the
+        # socket and response were made independent of this HTTPConnection
+        # object since a new request requires that we open a whole new
+        # connection
+        #
+        # this means the prior response had one of two states:
+        #   1) will_close: this connection was reset and the prior socket and
+        #                  response operate independently
+        #   2) persistent: the response was retained and we await its
+        #                  isclosed() status to become true.
+        #
+        if self._HTTPConnection__state != httplib._CS_REQ_SENT or self._HTTPConnection__response:
+            raise ResponseNotReady()
+
+        args = (self.sock,)
+        kwds = {"strict":self.strict, "method":self._method}
+        if self.debuglevel > 0:
+            args += (self.debuglevel,)
+        if buffering:
+            #only add this keyword if non-default, for compatibility with
+            #other response_classes.
+            kwds["buffering"] = True;
+
+        while True:
+            try:
+                response = self.response_class(*args, **kwds)
+                response.begin()
+                yield response
+            except socket.timeout:
+                self._HTTPConnection__state = httplib._CS_IDLE
+                return
+
+        assert response.will_close != httplib._UNKNOWN
+        self._HTTPConnection__state = httplib._CS_IDLE
+
+        if response.will_close:
+            # this effectively passes the connection to the response
+            self.close()
+        else:
+            # remember this, so we can tell when it is complete
+            self._HTTPConnection__response = response
+
+    def _create_pseudo_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        """'Connect' to *address* and return the socket object.
+
+        Convenience function.  Connect to *address* (a 2-tuple ``(host,
+        port)``) and return the socket object.  Passing the optional
+        *timeout* parameter will set the timeout on the socket instance
+        before attempting to connect.  If no *timeout* is supplied, the
+        global default timeout setting returned by :func:`getdefaulttimeout`
+        is used.  If *source_address* is set it must be a tuple of (host, port)
+        for the socket to bind as a source address before making the connection.
+        An host of '' or port 0 tells the OS to use the default.
+        """
+
+        host, port = address
+        err = None
+        for res in socket.getaddrinfo(host, port, 0, socket.SOCK_DGRAM):
+            af, socktype, proto, canonname, sa = res
+            sock = None
+            try:
+                sock = socket.socket(af, socktype, proto)
+                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(timeout)
+                if source_address:
+                    sock.bind(source_address)
+                return PseudoConnectedSocket(sa, sock)
+            
+            except socket.error as _:
+                err = _
+                if sock is not None:
+                    sock.close()
+
+        if err is not None:
+            raise err
+        else:
+            raise error("getaddrinfo returns an empty list")
+            
 
     def close(self):
-        self.connected = False
-        self.accepting = False
-        self.connecting = False
-        #do not close socket
-
-class SSDPClientConnection(_SSDPConnection, http.HTTPClientConnection):
-
-    def __init__(self, server, remote_address):
-        http.HTTPClientConnection.__init__(self, server, None, remote_address)
-        self.connected = True
-
-class SSDPServerConnection(_SSDPConnection, http.HTTPServerConnection):
-
-    def __init__(self, server, remote_address, data):
-        self._incomming = data
-        http.HTTPServerConnection.__init__(self, server, None, remote_address)
-        self.connected = True
-
-        #handle incomming data
-        self.handle_read()
-
-    def recv(self, buffer_size):
-        return self._incomming
-
-    def handle_message(self):        
-        #Subclass HTTPServerConnection.handle_message not to send a response on error
-        message = self.message
-        self.message = None
-
-        self.set_next_handler(self.found_request)
-
-        try:
-            self.server.handle_request(message)
-        except Exception, e:
-            self.logger.exception("handle_request failed")
+        if self.auto_open:
+            httplib.HTTPConnection.close(self)

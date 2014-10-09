@@ -7,16 +7,15 @@ __license__ = 'GNU LESSER GENERAL PUBLIC LICENSE Version 2.1'
 
 import logging
 import socket
-
+import errno
 from persist import DB
+import ssl
 
-from http import _HTTPConnection, HTTPClientConnection, HTTPServerConnection
-
-from uuid import UUID
-NAMESPACE_CERT = UUID('acf2b7b8-ba52-4ccb-8484-67c7d17e98bf')
+import gevent.ssl, gevent.socket
+from gevent.socket import timeout_default
 
 try:
-    from M2Crypto import SSL, m2
+    from M2Crypto_ import SSL, m2
     sslpackage = 'm2crypto'
 except ImportError, e:
     try:
@@ -26,123 +25,6 @@ except ImportError, e:
         raise type(e)("package python-openssl|python-m2crypto missing")
 
 if sslpackage == 'm2crypto':
-    class _SSLHTTPConnection(_HTTPConnection):
-
-        def create_socket(self):
-            _HTTPConnection.create_socket(self)
-            self.socket = ssl_connection(self.socket, 'control')
-
-        def reconnect(self):
-            conn = self.__class__(self.server, None, self.remote_address)
-            conn.create_socket()
-            try:
-                conn.socket.set_session(self.socket.get_session())        
-            except AssertionError:
-                pass
-            return conn
-
-        def connect(self, address):
-            self.connected = False
-            self.connecting = True
-            from errno import EINPROGRESS, EALREADY, EWOULDBLOCK, EINVAL, EISCONN
-            try:
-                self.socket.socket.connect(address)
-            except socket.error, e:
-                if e.errno in (EINPROGRESS, EALREADY, EWOULDBLOCK) \
-                        or e.errno == EINVAL and os.name in ('nt', 'ce'):
-                    self.addr = address
-                    return
-                if e.errno in (0, EISCONN):
-                    self.addr = address
-                    self.handle_connect_event()
-                raise
-
-        def handle_connect_event(self):
-            self.socket.setup_ssl()
-            self.socket.set_connect_state()
-            if self.socket.connect_ssl():
-                self.connecting = False
-                self.connected = True
-            else:
-                self.ssl_handshake_pending = True
-
-        def do_ssl_shutdown(self):
-            old = self.socket.get_shutdown()
-            self.socket.close()
-            if self.socket.get_shutdown() == m2.SSL_SENT_SHUTDOWN | m2.SSL_RECEIVED_SHUTDOWN or self.socket.get_shutdown() == old:
-                self.ssl_shutdown_pending = False
-                self.connected = False
-                self.do_close()
-                        
-        def handle_read_event(self):
-            try:
-                if self.ssl_handshake_pending:
-                    self.do_ssl_handshake()
-                elif self.ssl_shutdown_pending:
-                    self.do_ssl_shutdown()
-                else:
-                    _HTTPConnection.handle_read_event(self)
-            except SSL.SSLError, e:
-                self.logger.error("handle_read_event : %s", e)
-                self.socket.clear()
-                self.handle_close()
-
-        def handle_write_event(self):
-            try:
-                if self.ssl_handshake_pending:
-                    self.do_ssl_handshake()
-                elif self.ssl_shutdown_pending:
-                    self.do_ssl_shutdown()
-                else:
-                    _HTTPConnection.handle_write_event(self)
-            except SSL.SSLError, e:
-                self.logger.error("handle_write_event : %s", e)
-                self.socket.clear()
-                self.handle_close()
-
-        def close(self):
-            if self.connected == True and not self.ssl_shutdown_pending:
-                self.ssl_shutdown_pending = True 
-                self.do_ssl_shutdown()
-            else:
-                self.logger.warning("close already required ...")
-                self.ssl_shutdown_pending = False
-                self.connected = False
-                self.do_close()
-
-        do_close = _HTTPConnection.close
-
-    class SSLHTTPClientConnection(_SSLHTTPConnection, HTTPClientConnection):
-
-        def __init__(self, *args, **kwargs):
-            HTTPClientConnection.__init__(self, *args, **kwargs)
-            self.session = None
-            self.ssl_handshake_pending = False
-            self.ssl_shutdown_pending = False
-
-        def do_ssl_handshake(self):
-            if self.socket.connect_ssl():
-                self.ssl_handshake_pending = False
-                self.connecting = False
-                self.connected = True
-            else:
-                self.ssl_handshake_pending = True
-    
-    class SSLHTTPServerConnection(_SSLHTTPConnection, HTTPServerConnection):
-
-        def __init__(self, *args, **kwargs):
-            HTTPServerConnection.__init__(self, *args, **kwargs)
-            self.session = None
-            self.ssl_handshake_pending = False
-            self.ssl_shutdown_pending = False
-
-        def do_ssl_handshake(self):
-            if self.socket.accept_ssl():
-                self.ssl_handshake_pending = False
-                self.connecting = False
-                self.connected = True
-            else:
-                self.ssl_handshake_pending = True
 
     def ssl_connection(socket, type=None):
 
@@ -151,7 +33,7 @@ if sslpackage == 'm2crypto':
         ctx.set_verify(SSL.verify_peer, 0, callback=_ssl_verify_peer)  #request client cert
 
         if type:
-            with certificate(type) as certfile:
+            with certificate_file(type) as certfile:
                 ctx.load_cert(certfile)
 
             if type == 'device':
@@ -199,38 +81,10 @@ if sslpackage == 'm2crypto':
         # Deprecated
         return True
 
-    class certificate(object):
-
-        def __init__(self, type):
-            with DB() as db:
-                try:
-                    self.pem = db['certfile.%s' % type]
-                except KeyError:
-                    cert, key =_gen_certificate(type)
-                    self.pem = db['certfile.%s' % type] = cert.as_pem() + key.as_pem(cipher=None)
-
-        def __enter__(self):
-            from tempfile import NamedTemporaryFile
-            self.certfile = cf = NamedTemporaryFile('w', bufsize=0, suffix='.pem')
-            cf.write(self.pem)
-            return cf.name
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            self.certfile.close()
 
     def get_peer_certificate(conn):
         return conn.get_peer_cert()
 
-    def cert_uuid(cert):
-        """Generate a UUID from the SHA-256 hash of a certificate."""
-
-        der = cert.as_der()
-
-         #cf uuid.py
-        from hashlib import sha256
-        hash = sha256(NAMESPACE_CERT.bytes + der).digest()
-
-        return UUID(bytes=hash[:16], version=5)    
 
     def _gen_certificate(type):
 
@@ -264,74 +118,6 @@ if sslpackage == 'm2crypto':
 
 elif sslpackage == 'openssl':
 
-    class _SSLHTTPConnection(_HTTPConnection):
-        def __init__(self, *args, **kwargs):
-            _HTTPConnection.__init__(self, *args, **kwargs)
-            self.ssl_handshake_pending = True
-            self.ssl_shutdown_pending = False
-
-        def create_socket(self):
-            _HTTPConnection.create_socket(self)
-            self.socket = ssl_connection(self.socket, 'control')
-
-        def do_ssl_handshake(self):
-            try:
-                self.socket.do_handshake()
-            except SSL.WantReadError, SSL.WantWriteError:
-                pass
-            else:
-                self.ssl_handshake_pending = False
-
-        def do_ssl_shutdown(self):
-            self.logger.info('do_ssl_shutdown : %d' % self.socket.get_shutdown())
-            try:
-                if self.socket.shutdown():
-                    self.logger.info('do_ssl_shutdown finished : %d' % self.socket.get_shutdown())
-                    self.ssl_shutdown_pending = False
-                    _HTTPConnection.handle_close(self)
-            except Exception, e:
-                self.logger.exception('do_ssl_shutdown error : %s', e)
-                self.ssl_shutdown_pending = False
-                _HTTPConnection.handle_close(self)
-
-
-        def handle_read_event(self):
-            try:
-                if self.ssl_handshake_pending:
-                    self.do_ssl_handshake()
-                elif self.ssl_shutdown_pending:
-                    self.do_ssl_shutdown()
-                else:
-                    _HTTPConnection.handle_read_event(self)
-            except SSL.ZeroReturnError:
-                self.handle_close()
-
-        def handle_write_event(self):
-            try:
-                if self.ssl_handshake_pending:
-                    self.do_ssl_handshake()
-                elif self.ssl_shutdown_pending:
-                    self.do_ssl_shutdown()
-                else:
-                    _HTTPConnection.handle_write_event(self)
-            except SSL.ZeroReturnError:
-                self.handle_close()
- 
-        def handle_close(self):
-            if self.connected == True and not self.ssl_shutdown_pending:
-                self.ssl_shutdown_pending = True
-                self.do_ssl_shutdown()
-
-        #def writable(self):
-        #    return _HTTPConnection.writable(self) or self.ssl_shutdown_pending or self.ssl_handshake_pending
-
-
-    class SSLHTTPClientConnection(_SSLHTTPConnection, HTTPClientConnection):
-        pass
-    
-    class SSLHTTPServerConnection(_SSLHTTPConnection, HTTPServerConnection):
-        pass
-
     def ssl_connection(socket, type=None):
 
         ctx = SSL.Context(SSL.TLSv1_METHOD)
@@ -345,6 +131,163 @@ elif sslpackage == 'openssl':
                 #ctx.set_session_cache_mode(SSL.SESS_CACHE_SERVER)
 
         return SSL.Connection(ctx, socket)
+
+    _PROTO_MAPPING = dict((getattr(ssl, 'PROTOCOL_%s'%v, None), getattr(SSL, '%s_METHOD'%v, None))
+                          for v in ['SSLv2', 'SSLv23', 'SSLv3', 'TLSv1', 'TLSv1_1', 'TLSv1_2'])
+
+    def sslwrap(sock, server_side,
+                keyfile, certfile,
+                cert_reqs, ssl_version,
+                ca_certs, ciphers=None):
+
+        ctx = SSL.Context(_PROTO_MAPPING[ssl_version])
+
+        ctx.use_certificate(certfile)
+        ctx.use_privatekey(keyfile)
+
+        ctx.set_verify(cert_reqs, _verify_peer)
+        if ca_certs:
+            ctx.load_verify_locations(ca_certs)            
+        else:
+            ctx.set_default_verify_paths()
+        if ciphers:
+            ctx.set_cipher_list(ciphers)
+
+        conn = SSL.Connection(ctx, sock)
+        if server_side:
+            conn.set_accept_state()
+
+        return conn
+
+    class _SSLSocket(object):
+
+        def read(self, len=1024):
+            """Read up to LEN bytes and return them.
+            Return zero-length string on EOF."""
+            while True:
+                try:
+                    return self._sslobj.read(len)
+                except SSL.WantReadError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._read_event, timeout_exc=gevent.ssl._SSLErrorReadTimeout)
+                except SSL.WantWriteError:
+                    if self.timeout == 0.0:
+                        raise
+                    # note: using _SSLErrorReadTimeout rather than _SSLErrorWriteTimeout below is intentional
+                    self._wait(self._write_event, timeout_exc=gevent.ssl._SSLErrorReadTimeout)
+                    
+                except Exception, e:
+                    if e.args == (-1, 'Unexpected EOF') and self.suppress_ragged_eofs:
+                        return ''
+                    else:
+                        raise
+
+        def write(self, data):
+            """Write DATA to the underlying SSL channel.  Returns
+            number of bytes of DATA actually transmitted."""
+            while True:
+                try:
+                    return self._sslobj.write(data)
+                except SSL.WantReadError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._read_event, timeout_exc=gevent.ssl._SSLErrorWriteTimeout)
+                except SSL.WantWriteError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._write_event, timeout_exc=gevent.ssl._SSLErrorWriteTimeout)
+        
+        def getpeercert(self, binary_form=False):
+            """Returns a formatted version of the data in the
+            certificate provided by the other end of the SSL channel.
+            Return None if no certificate was provided, {} if a
+            certificate was provided, but not validated."""
+            return self._sslobj.get_peer_certificate()
+
+        def send(self, data, flags=0, timeout=timeout_default):
+            if timeout is timeout_default:
+                timeout = self.timeout
+            if self._sslobj:
+                if flags != 0:
+                    raise ValueError(
+                        "non-zero flags not allowed in calls to send() on %s" %
+                        self.__class__)
+                while True:
+                    try:
+                        v = self._sslobj.write(data)
+                    except SSL.WantReadError:
+                        if self.timeout == 0.0:
+                            return 0
+                        self._wait(self._read_event)
+                    except SSL.WantWriteError:
+                        if self.timeout == 0.0:
+                            return 0
+                        self._wait(self._write_event)
+                    else:
+                        return v
+            else:
+                return socket.send(self, data, flags, timeout)
+
+        def _sslobj_shutdown(self):
+            while True:
+                try:
+                    return self._sslobj.shutdown()
+                except Exception, e:
+                    if e.args == (-1, 'Unexpected EOF') and self.suppress_ragged_eofs:
+                        return ''
+                    else:
+                        raise
+                except SSL.WantReadError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._read_event, timeout_exc=gevent.ssl._SSLErrorReadTimeout)
+                except SSL.WantWriteError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._write_event, timeout_exc=gevent.ssl._SSLErrorWriteTimeout)
+
+        def recv_into(self, buffer, nbytes=None, flags=0):
+            if buffer and (nbytes is None):
+                nbytes = len(buffer)
+            elif nbytes is None:
+                nbytes = 1024
+            if self._sslobj:
+                if flags != 0:
+                    raise ValueError(
+                        "non-zero flags not allowed in calls to recv_into() on %s" %
+                        self.__class__)
+                while True:
+                    try:
+                        tmp_buffer = self.read(nbytes)
+                        v = len(tmp_buffer)
+                        buffer[:v] = tmp_buffer
+                        return v
+                    except SSL.WantReadError:
+                        if self.timeout == 0.0:
+                            raise
+                        self._wait(self._read_event)
+                        continue
+            else:
+                return socket.recv_into(self, buffer, nbytes, flags)
+
+
+        def do_handshake(self):
+            """Perform a TLS/SSL handshake."""
+            while True:
+                try:
+                    return self._sslobj.do_handshake()
+
+                except SSL.WantReadError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._read_event, timeout_exc=gevent.ssl._SSLErrorHandshakeTimeout)
+
+                except SSL.WantWriteError:
+                    if self.timeout == 0.0:
+                        raise
+                    self._wait(self._write_event, timeout_exc=gevent.ssl._SSLErrorHandshakeTimeout)
+
 
     def _verify_peer(conn, x509, err, depth, code):
         #logging.debug('_verify_peer : %r, %r, %r, %r, %r', conn, x509, err, depth, code)
@@ -366,19 +309,12 @@ elif sslpackage == 'openssl':
 
         return (cert, key)
 
-    def get_peer_certificate(conn):
-        return conn.get_peer_certificate()
+    def get_peer_info(sock):
+        cert = sock.getpeercert()
+        if not cert:
+            return
+        return crypto.dump_certificate(crypto.FILETYPE_ASN1, cert), cert.get_subject().CN
 
-    def cert_uuid(cert):
-        """Generate a UUID from the SHA-256 hash of a certificate."""
-
-        der = crypto.dump_certificate(crypto.FILETYPE_ASN1, cert)   
-
-         #cf uuid.py
-        from hashlib import sha256
-        hash = sha256(NAMESPACE_CERT.bytes + der).digest()
-
-        return UUID(bytes=hash[:16], version=5)    
 
     def _gen_certificate(type):
 
@@ -399,6 +335,103 @@ elif sslpackage == 'openssl':
         cert.sign(k, 'sha256')
 
         return cert, k
+
+class SSLSocket(_SSLSocket, gevent.ssl.SSLSocket):
+
+    def __init__(self, sock, keyfile=None, certfile=None,
+                 server_side=False, cert_reqs=ssl.CERT_NONE,
+                 ssl_version=ssl.PROTOCOL_SSLv23, ca_certs=None,
+                 do_handshake_on_connect=True,
+                 suppress_ragged_eofs=True,
+                 ciphers=None):
+
+        gevent.socket.socket.__init__(self, _sock=sock)
+
+        if certfile and not keyfile:
+            keyfile = certfile
+        # see if it's connected
+        try:
+            socket.socket.getpeername(self)
+        except socket.error, e:
+            if e[0] != errno.ENOTCONN:
+                raise
+            # no, no connection yet
+            self._sslobj = None
+        else:
+            # yes, create the SSL object
+            if ciphers is None:
+                self._sslobj = sslwrap(self._sock, server_side,
+                                            keyfile, certfile,
+                                            cert_reqs, ssl_version, ca_certs)
+            else:
+                self._sslobj = sslwrap(self._sock, server_side,
+                                            keyfile, certfile,
+                                            cert_reqs, ssl_version, ca_certs,
+                                            ciphers)
+            if do_handshake_on_connect:                
+                self.do_handshake()
+
+        self.keyfile = keyfile
+        self.certfile = certfile
+        self.cert_reqs = cert_reqs
+        self.ssl_version = ssl_version
+        self.ca_certs = ca_certs
+        self.ciphers = ciphers
+        self.do_handshake_on_connect = do_handshake_on_connect
+        self.suppress_ragged_eofs = suppress_ragged_eofs
+        self._makefile_refs = 0
+
+def wrap_socket(sock, keyfile=None, certfile=None,
+                server_side=False, cert_reqs=gevent.ssl.CERT_NONE,
+                ssl_version=gevent.ssl.PROTOCOL_SSLv23, ca_certs=None,
+                do_handshake_on_connect=True,
+                suppress_ragged_eofs=True, ciphers=None):
+    """Create a new :class:`SSLSocket` instance."""
+    return SSLSocket(sock, keyfile=keyfile, certfile=certfile,
+                     server_side=server_side, cert_reqs=cert_reqs,
+                     ssl_version=ssl_version, ca_certs=ca_certs,
+                     do_handshake_on_connect=do_handshake_on_connect,
+                     suppress_ragged_eofs=suppress_ragged_eofs,
+                     ciphers=ciphers)
+
+_CERTFILES = dict()
+def certificate_file(type):
+
+    if type in _CERTFILES:
+        return _CERTFILES[type].name
+
+    with DB() as db:
+        try:
+            pem = db['certfile.%s' % type]
+        except KeyError:
+            cert, key = _gen_certificate(type)
+            pem = db['certfile.%s' % type] = cert.as_pem() + key.as_pem(cipher=None)
+
+    from tempfile import NamedTemporaryFile
+    temp = _CERTFILES[type] = NamedTemporaryFile('w', bufsize=0, suffix='.pem')
+    temp.write(pem)
+
+    return temp.name   
+
+# class certificate_file(object):
+
+#     def __init__(self, type):
+#         with DB() as db:
+#             try:
+#                 self.pem = db['certfile.%s' % type]
+#             except KeyError:
+#                 cert, key = _gen_certificate(type)
+#                 self.pem = db['certfile.%s' % type] = cert.as_pem() + key.as_pem(cipher=None)
+
+#     def __enter__(self):
+#         from tempfile import NamedTemporaryFile
+#         self.certfile = cf = NamedTemporaryFile('w', bufsize=0, suffix='.pem')
+#         cf.write(self.pem)
+        
+#         return cf.name
+
+#     def __exit__(self, exc_type, exc_val, exc_tb):
+#         self.certfile.close()
 
 
 def _get_cn(type):

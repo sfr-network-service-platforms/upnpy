@@ -12,6 +12,7 @@ sys.path += ['.']
 import upnpy
 from upnpy.device import BaseService, BaseDevice, StateVariable, action, ActionError, _TextElement, _getURL
 from upnpy import utils
+import gevent
 
 try:
     from xml.etree import cElementTree as ElementTree
@@ -47,7 +48,7 @@ class BasicContentDirectory(BaseService):
                            NumberReturned = 'A_ARG_TYPE_Count',
                            TotalMatches = 'A_ARG_TYPE_Count',
                            UpdateID = 'A_ARG_TYPE_UpdateID'))
-    def Browse(self, _request, ObjectID='0', BrowseFlag='BrowseDirectChildren', Filter='',
+    def Browse(self, _env, ObjectID='0', BrowseFlag='BrowseDirectChildren', Filter='',
                StartingIndex=0, RequestedCount=None, SortCriteria=''):
 
         relpath = '' if ObjectID == '0' else ObjectID
@@ -61,7 +62,7 @@ class BasicContentDirectory(BaseService):
         ret = []
 
         if BrowseFlag == 'BrowseMetadata':
-            meta = self._get_metadata(_request, relpath, ObjectID)
+            meta = self._get_metadata(_env, relpath, ObjectID)
             if not meta:
                 raise ActionError(402, detail = "invalid ObjectID %s" % ObjectID)
             ret.append(meta)
@@ -71,7 +72,7 @@ class BasicContentDirectory(BaseService):
                 raise ActionError(402, detail = "invalid ObjectID %s" % ObjectID)
             data = os.listdir(fullpath)
             for d in data:
-                meta = self._get_metadata(_request, os.path.join(relpath, d), ObjectID)
+                meta = self._get_metadata(_env, os.path.join(relpath, d), ObjectID)
                 if meta:
                     ret.append(meta)
         else:
@@ -82,7 +83,7 @@ class BasicContentDirectory(BaseService):
         return dict(Result=utils.tostring(didl, default_namespace=DNS.ns),
                     NumberReturned=len(didl), TotalMatches=len(ret), UpdateID=0)
 
-    def _get_metadata(self, _request, relpath, parent):
+    def _get_metadata(self, _env, relpath, parent):
 
         fullpath = os.path.join(self.content_path, relpath)
         oid = relpath
@@ -92,6 +93,7 @@ class BasicContentDirectory(BaseService):
             o.extend([
                     _TextElement(UNS('class'), 'object.container'),
                     ])
+
         elif os.path.isfile(fullpath):
             import mimetypes, urllib
             mime = mimetypes.guess_type(relpath, strict=False)[0]
@@ -105,36 +107,51 @@ class BasicContentDirectory(BaseService):
             o = ElementTree.Element(DNS('item'), {DNS('id'):oid, DNS('parentID'):parent, DNS('restricted'):'1'})
             o.extend([
                     _TextElement(UNS('class'), 'object.item' + ('.%sItem' % mt if mt else '')),
-                    _TextElement(DNS('res'), _getURL(_request,
+                    _TextElement(DNS('res'), _getURL(_env,
                                                     "content?%s" % urllib.urlencode(dict(id=oid.encode('utf-8'))),
                                                     True),
                                  {DNS('protocolInfo'):'http-get:*:%s:*' % mime})
                     ])
+
         else:
             return
         o.append(_TextElement(DCNS('title'), os.path.basename(relpath)))
         return o
         
-    def _GET_content(self, request, id):
+    def _GET_content(self, env, start_response):
+
+        import urlparse, upnpy.utils
+        for k, v in urlparse.parse_qsl(env['QUERY_STRING']):
+            if k == 'id':
+                id = v
+                break
+        else:
+            start_response(upnpy.utils.status(404), [])
+            return []
+
         import base64, os
         relpath = id.decode('utf-8')
         fullpath = os.path.join(self.content_path, relpath)
         
         if not fullpath.startswith(self.content_path) or not os.path.isfile(fullpath):
-            return(404,)
+            start_response(upnpy.utils.status(404), [])
+            return []
 
         import mimetypes
         size = os.path.getsize(fullpath)
         headers = {'Content-Type': mimetypes.guess_type(relpath, strict=False)[0],
                    'Accept-Ranges': 'bytes'}
 
-        range = request.headers.get('Range', None)
+        range = env.get('HTTP_RANGE', None)
         if not range:
-            return (200, self._file_generator(fullpath, 0, size-1), dict(headers, **{'Content-Length' : size}))
+            start_response(upnpy.utils.status(200), dict(headers, **{'Content-Length' : size}).items())
+            return self._file_generator(fullpath, 0, size-1)
 
         unit, spec = range.split('=', 1)        
         if unit != 'bytes':
-            return (416,)                
+            start_response(upnpy.utils.status(416), [])
+            return []
+
         #support only one range:
         spec = spec.split(',')[0]
 
@@ -143,16 +160,19 @@ class BasicContentDirectory(BaseService):
         end = int(end or size-1)
 
         if end<start:
-            return (200, self._file_generator(fullpath, 0, size-1), dict(headers, **{'Content-Length' : size}))
+            start_response(upnpy.utils.status(200), dict(headers, **{'Content-Length' : size}).items())
+            return self._file_generator(fullpath, 0, size-1)
 
         if start>=size or end==0:
-            return (416, )
+            start_response(upnpy.utils.status(416), [])
+            return []
        
         end = max(end, size-1)
 
-        return (206, self._file_generator(fullpath, start, end),
-                dict(headers, **{'Content-Length' : str(1+end-start),
-                                 'Content-Range' : "bytes %d-%d/%d" % (start, end, size)}))
+
+        start_response(upnpy.utils.status(206), dict(headers, **{'Content-Length' : str(1+end-start),
+                                 'Content-Range' : "bytes %d-%d/%d" % (start, end, size)}).items())       
+        return self._file_generator(fullpath, start, end)
 
     def _file_generator(self, path, start=0, end=0):
         f = file(path)
@@ -198,7 +218,8 @@ def main():
     u = upnpy.Upnpy()
     u.devices['BasicMediaServer'] = BasicMediaServer(content_path=unicode(path))
     #u.devices['BasicMediaServer'].services['contentDirectory'].A_ARG_TYPE_UpdateID = 5
-    u.serve_forever()    
+
+    gevent.wait()
 
 if __name__ == '__main__':
     main()

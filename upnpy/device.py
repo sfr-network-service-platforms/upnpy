@@ -14,6 +14,8 @@ except:
     from xml.etree import ElementTree
 
 import utils
+import http, urlparse
+from wsgiref.util import shift_path_info, guess_scheme
 
 SQNS = utils.Namespace('http://schemas.xmlsoap.org/soap/envelope/', 'soap')
 DNS = utils.Namespace('urn:schemas-upnp-org:device-1-0', 'device')
@@ -31,21 +33,17 @@ class BaseUPnPObject(object):
             if k not in self._ATTRS:
                 raise TypeError('Unknown attribute %s' % k)
             setattr(self, k, v)
-        _last_advertisement = None
 
-    def _dispatch(self, request):
+    def _dispatch(self, env, start_response):
 
-        if not hasattr(request, 'protection') and self._protection:
-            import protection
-            self._protection._handle_request(request, self)
-
-        part = request.path[0]
-
-        method = getattr(self, '_%s_%s' % (request.method, part.replace('.','_')), None)
-        if len(request.path) == 1 and method:
-            return method(request, **request.query)
-            
-        return (404, )
+        part = shift_path_info(env)
+        
+        method = getattr(self, '_%s_%s' % (env['REQUEST_METHOD'], part.replace('.','_')), None)
+        if len(env['PATH_INFO'].split('/')) == 1 and method:
+            return method(env, start_response)
+           
+        start_response(utils.status(404), [])
+        return []
 
     @property
     def _parents(self):
@@ -106,19 +104,21 @@ class BaseDevice(BaseUPnPObject):
             for i, D in self.DEVICES.items():
                 self.devices[i] = D()
 
-    def _dispatch(self, request):
+    def _dispatch(self, env, start_response):
 
-        if len(request.path) > 1:
-            part = request.path.pop(0)
+        if len(env['PATH_INFO'].split('/'))>2:
+            part = shift_path_info(env)
 
-            request.base = _getURL(request, '%s/' % part)
             if part in self.services:
-                return self.services[part]._dispatch(request)
+                return self.services[part]._dispatch(env, start_response)
 
             elif part in self.devices:
-                return self.devices[part]._dispatch(request)
+                return self.devices[part]._dispatch(env, start_response)
 
-        return super(BaseDevice, self)._dispatch(request)
+            start_response(utils.status(404), [])
+            return []
+
+        return super(BaseDevice, self)._dispatch(env, start_response)
 
     def __getattr__(self, attr):
         if attr == 'UDN':
@@ -154,7 +154,7 @@ class BaseDevice(BaseUPnPObject):
             if ret:
                 return ret
 
-    def _GET_desc_xml(self, request):
+    def _GET_desc_xml(self, env, start_response):
 
         dev = ElementTree.Element(DNS('device'))
 
@@ -173,9 +173,8 @@ class BaseDevice(BaseUPnPObject):
         if self.devices:
             devs = ElementTree.SubElement(dev, DNS('deviceList'))
             for name, d in self.devices.items():
-                devs.append(s._GET_desc_xml(request))
+                devs.append(s._GET_desc_xml(env, start_response))
         
-
         if self._parent:
             return dev
 
@@ -189,7 +188,8 @@ class BaseDevice(BaseUPnPObject):
 
         root.append(dev)
 
-        return (200, utils.tostring(root, default_namespace=DNS.ns), {'Content-Type' : 'text/xml'})
+        start_response(utils.status(200), [('Content-Type', 'text/xml')])
+        return [utils.tostring(root, default_namespace=DNS.ns)]
 
 class BaseService(BaseUPnPObject):
     _ATTRS = ['serviceType', 'serviceId']
@@ -213,7 +213,7 @@ class BaseService(BaseUPnPObject):
     def USN(self):
         return "%s::%s" % (self._parent.UDN, self.serviceType)
 
-    def _GET_desc_xml(self, request):
+    def _GET_desc_xml(self, env, start_response):
         
         scpd = ElementTree.Element(SNS('scpd'))
 
@@ -233,25 +233,18 @@ class BaseService(BaseUPnPObject):
                 getattr(cls, n).desc(n) for n in dir(cls) if isinstance(getattr(cls, n), StateVariable)
                 ])
 
+        start_response(utils.status(200), [('Content-Type', 'text/xml')])
+        return [utils.tostring(scpd, default_namespace=SNS.ns)]
+
+
+    def _POST_control(self, env, start_response):
         
-        return (200, utils.tostring(scpd, default_namespace=SNS.ns), {'Content-Type' : 'text/xml'})
-
-
-    def _POST_control(self, request):
-        
-        #for p in request.headers.get('Content-Type', '').split(';'):
-        #    if p.strip().startswith('charset='):
-        #        charset = p[8:].strip("'")
-        #        body = body.decode(charset)
-        #        #print "set encoding", charset
-        #        break
-
-        body = ElementTree.fromstring(request.body).find(SQNS('Body/*'))
+        body = ElementTree.fromstring(env['wsgi.input'].read()).find(SQNS('Body/*'))
 
         stnse = self._stns("")
 
-        action = body.tag[len(stnse):]
-        args = dict()
+        env['upnp.action'] = action = body.tag[len(stnse):]
+        env['upnp.args'] = args = dict()
         for e in list(body):
             name = e.tag
             value = e.text
@@ -260,20 +253,21 @@ class BaseService(BaseUPnPObject):
             if name.startswith(stnse):
                 name = name[len(stnse):]
             args[name] = value
-
+            
         method = getattr(self, action, None)
 
         try:
             if not method or not isinstance(method, Action):
-                self._logger.info("invalid action : %s %s", body.tag, stnse)
+                self._logger.error("invalid action : %s %s", body.tag, stnse)
                 raise ActionError(401, detail = action)
-            return self._do_action(action, method, request, args)
-        except ActionError, e:
-            return self._send_error(e)
+            return self._send_response(env, start_response, self._do_action(env, method))
 
-    def _do_action(self, action, method, request, args):
+        except ActionError, e:
+            return self._send_error(env, start_response, e)
+
+    def _do_action(self, env, method):
         try:
-            return self._send_response(action, method(self, request, args))
+            return method(self, env)
         except ActionError, e:
             raise
         except Exception, e:
@@ -281,21 +275,21 @@ class BaseService(BaseUPnPObject):
             traceback.print_exc()
             raise ActionError(501, detail = str(e))
 
-    def _send_response(self, action, ret):
+    def _send_response(self, env, start_response, response):
        
-        env = ElementTree.Element(SQNS('Envelope'), {SQNS('encodingStyle'):SES})
+        envelope = ElementTree.Element(SQNS('Envelope'), {SQNS('encodingStyle'):SES})
 
         ElementTree.SubElement(
-            ElementTree.SubElement(env,SQNS('Body')),
-            self._stns('%sResponse'%action)).extend([
-                _TextElement(self._stns(k), v) for k, v in ret.items()
+            ElementTree.SubElement(envelope,SQNS('Body')),
+            self._stns('%sResponse'%env['upnp.action'])).extend([
+                _TextElement(self._stns(k), v) for k, v in response.items()
                 ])
-
-        return (200, utils.tostring(env, default_namespace=SQNS.ns), {'Content-Type' : 'text/xml'})
-
-    def _send_error(self, error):
+        start_response(utils.status(200), [('Content-Type', 'text/xml')])
+        return [utils.tostring(envelope, default_namespace=SQNS.ns)]
+    
+    def _send_error(self, env, start_response, error):
         
-        env = ElementTree.Element(SQNS('Envelope'), {SQNS('encodingStyle'):SES})
+        envelope = ElementTree.Element(SQNS('Envelope'), {SQNS('encodingStyle'):SES})
         
         desc = ", ".join(filter(lambda p:p, [error.description, error.detail]))
         err = ElementTree.Element(CNS('UPnPError'))
@@ -306,61 +300,77 @@ class BaseService(BaseUPnPObject):
         detail = ElementTree.Element(SQNS('detail'))
         detail.append(err)
 
-        fault = ElementTree.SubElement(ElementTree.SubElement(env,SQNS('Body')), SQNS('Fault'))
+        fault = ElementTree.SubElement(ElementTree.SubElement(envelope,SQNS('Body')), SQNS('Fault'))
         fault.extend([
-                _TextElement('faultCode', 'Client'),
-                _TextElement('faultString', 'UPnPError'),
+                _TextElement(SQNS('faultCode'), 'Client'),
+                _TextElement(SQNS('faultString'), 'UPnPError'),
                 detail,
                 ])
   
-        return (500, utils.tostring(env, default_namespace=SQNS.ns), {'Content-Type' : 'text/xml'})
+        start_response(utils.status(500), [('Content-Type', 'text/xml')])
+        return [utils.tostring(envelope, default_namespace=SQNS.ns)]
 
-    def _SUBSCRIBE_event(self, request):
+    def _SUBSCRIBE_event(self, env, start_response):
 
         #force header connection: close pour bug gupnp
-        headers = dict()
-        if 'GUPnP' in request.headers.get('User-Agent', ''):
-            headers['Connection'] = 'close'
+        headers = []
+        if 'GUPnP' in env.get('HTTP_USER_AGENT', ''):
+            headers.append(('Connection', 'close'))
 
         try:
-            timeout = int(request.headers.get('TIMEOUT').split('-')[1])
+            timeout = int(env.get('HTTP_TIMEOUT').split('-')[1])
         except:
             timeout = self.EXPIRY
 
-        if request.headers.get('CALLBACK', None):
-            if request.headers.get('SID', None): return (400, None, headers)
-            sub = _Subscription(self, request.headers.get('CALLBACK').strip('<>'), timeout)
-            self._subscription[sub.sid] = sub
+        callback = env.get('HTTP_CALLBACK', None)
+        sid = env.get('HTTP_SID', None)
 
+        if callback:
+            if sid:
+                start_response(utils.status(400), headers)
+                return []
+            sub = _Subscription(self, callback.strip('<>'), timeout)
+            self._subscription[sub.sid] = sub
             
             msg = self._notification_message()
             if msg:
-                self._parents[0]._upnpy.set_alarm(lambda:sub.notify(msg), 1)
+                import gevent
+                gevent.spawn_later(1, sub.notify, msg)
 
-            return (200, None, dict(headers, SID=sub.sid, TIMEOUT='Second-%d' % timeout))
+            headers += [('SID', sub.sid), ('TIMEOUT', 'Second-%d' % timeout)]
+            start_response(utils.status(200), headers)
+            return []
 
-        elif request.headers.get('SID', None):
-            if request.headers.get('CALLBACK', None): return (400, None, headers)
+        elif sid:
+            if callback:
+                start_response(utils.status(400), headers)
+                return []
             try:
-                self._subscription[request.headers.get('SID')].renew(timeout)
-                return (200, None, dict(headers, TIMEOUT='Second-%d' % timeout))
+                self._subscription[sid].renew(timeout)
+                headers.append(('TIMEOUT','Second-%d' % timeout))
+                start_response(utils.status(200), headers)
+                return []
             except KeyError:
-                return (412, None, headers)
+                pass
 
-        return (412, None, headers)
+        start_response(utils.status(412), headers)
+        return []
 
-    def _UNSUBSCRIBE_event(self, request):
+    def _UNSUBSCRIBE_event(self, env, start_response):
         try:
-            del self._subscription[request.headers.get('SID')]
-            return (200, )
+            del self._subscription[env.get('HTTP_SID')]
+            start_response(utils.status(200), [])
+            return []
         except KeyError:
-            return (412,)        
+            start_response(utils.status(412), [])
+            return []
 
     def _notify(self, keys):
 
+        now = time.time()
         msg = self._notification_message(keys)    
         for s in self._subscription.values():
-            if s.timeout < time.time():
+            if s.timeout < now:
                 del self._subscription[s]
                 continue
             s.notify(msg)
@@ -425,32 +435,32 @@ class Action(object):
         import inspect
         self.spec = inspect.getargspec(fct)
 
-    def __call__(self, service, request, args):
+    def __call__(self, service, env):
 
         pt = service._protection
         if pt:
             import protection
-            pt._check_acl(request, service, self)
+            pt._check_acl(env, service, self)
 
-        for k, v in args.items():
+        for k, v in env['upnp.args'].items():
             sv = getattr(service.__class__, self.params[k], None)
             if not isinstance(sv, StateVariable): continue
             try:
-                args[k] = sv.parse(v)
+                env['upnp.args'][k] = sv.parse(v)
             except Exception, e:
                 raise ActionError(402, detail = str(e))
             
-        if "_request" in self.spec.args:
-            args['_request'] = request
+        if "_env" in self.spec.args:
+            env['upnp.args']['_env'] = env
             
         missing = []
         for a in self.spec.args[1:len(self.spec.args or [])-len(self.spec.defaults or [])]:
-            if a not in args:
+            if a not in env['upnp.args']:
                 missing.append(a)
         if missing:
             raise ActionError(402, detail="missing argument(%s) %s" % ("s" if len(missing)>2 else "" , ", ".join(missing)))
         
-        ret = self.fct(service, **args)
+        ret = self.fct(service, **env['upnp.args'])
 
         if ret is None:
             ret = dict()
@@ -567,21 +577,27 @@ class _Subscription(object):
 
     def notify(self, message):
         
-        self.upnpy.http_request(self.callback, 'NOTIFY',
-                                callback=self._notify_response,
-                                headers = { 'NT' : 'upnp:event',
-                                            'NTS': 'upnp:propchange',
-                                            'SID': self.sid,
-                                            'SEQ': self.seq,
-                                            'CONTENT-TYPE': 'text/xml; charset="utf-8"'},
-                                body = message)
-        self.seq += 1
+        req = http.HTTPRequest(self.callback)
+        up = urlparse.urlparse(self.callback)
+        headers = { 'NT' : 'upnp:event',
+                    'NTS': 'upnp:propchange',
+                    'SID': self.sid,
+                    'SEQ': self.seq,
+                    'CONTENT-TYPE': 'text/xml; charset="utf-8"'}
+        
+        try:
+            req.request('NOTIFY', urlparse.urlunparse(('','')+up[2:]), message, headers)
+            res = req.getresponse(True)
+            if res.status != 200:
+                raise Exception('http error in sending notification %d %s' % (res.status, res.reason))
 
-    def _notify_response(self, resp):
-        if str(resp.code) != '200':
+        except Exception, e:            
+            self.service._logger.error('error in sending notification %s', e)
             self.missed += 1
-        if self.missed > 2:
-            del self.service._subscription[self.sid]
+            if self.missed > 2:
+                del self.service._subscription[self.sid]
+
+        self.seq += 1
     
 class _SubList(dict):
 
@@ -615,18 +631,18 @@ class _RootList(dict):
             import protection
             device.services['_protection'] = protection.Service()
 
-        if not self.upnpy._http:
+        if not self.upnpy.http:
             from http import HTTPServer
-            self.upnpy._http = HTTPServer(self.upnpy)
+            self.upnpy.http = HTTPServer(self.upnpy)
 
-        if not self.upnpy._https and device._protection:
+        if not self.upnpy.https and device._protection:
             from http import HTTPServer
-            self.upnpy._https = HTTPServer(self.upnpy, ssl=True)
+            self.upnpy.https = HTTPServer(self.upnpy, ssl=True)
 
-        self.upnpy._ssdp.advertise(device)
+        self.upnpy.ssdp.advertise(device)
 
         for i, s in device.services.items():
-            self.upnpy._ssdp.advertise(s)
+            self.upnpy.ssdp.advertise(s)
 
         for i, d in device.devices.items():
             self._add_device(d)
@@ -639,15 +655,15 @@ class _RootList(dict):
         self._del_device(device)
 
         if not len(self):
-            self.upnpy._http = None
-            self.upnpy._https = None
+            self.upnpy.http = None
+            self.upnpy.https = None
 
     def _del_device(self, device):
 
-        self.upnpy._ssdp.withdraw(device)
+        self.upnpy.ssdp.withdraw(device)
 
         for i, s in device.services.items():
-            self.upnpy._ssdp.withdraw(s)
+            self.upnpy.ssdp.withdraw(s)
 
         for i, d in device.devices.items():
             self._del_device(d)
@@ -682,16 +698,12 @@ def _TextElement(tag, text, attrib={}, **extra):
     ret.text = text
     return ret
 
-def _getURL(request, local, full=False):
+def _getURL(env, local, full=False):
     
-    url = request.base
-    url += local
-        
+    url = urlparse.urljoin(env['SCRIPT_NAME'], local)
+
     if full:
-        url = "%s://%s%s" % (
-            "https" if "SSL" in request.connection.__class__.__name__ else "http",
-            request.headers.get('Host'),
-            url)
+        url = urlparse.urljoin("%s://%s" % (guess_scheme(env), env['HTTP_HOST']), url)
 
     return url
     
