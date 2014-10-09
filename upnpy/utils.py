@@ -57,7 +57,7 @@ def genUUID():
     return 'uuid:%s' % uuid.uuid4()
 
 class StateVariable(object):
-    """base for state variable supporting data parsing/serializatino"""
+    """base for state variable supporting data parsing/serialization"""
     
     def parse(self, val):
         """parse a string and cast it depending on its dataType"""

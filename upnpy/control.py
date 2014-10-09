@@ -361,7 +361,12 @@ returns:
             if k in args and args[k] is not None and a.state_variable:
                 args[k] = a.state_variable.serialize(args[k])
 
-        return self.service._action(self.name, args)
+        ret = self.service._action(self.name, args)
+
+        for k, a in self.returns.items():
+            ret[k] = a.state_variable.parse(ret[k])
+
+        return ret
 
 class ActionError(Exception):
     pass
@@ -370,9 +375,9 @@ class StateVariable(utils.StateVariable):
 
     def __init__(self, desc):
 
-        self.parse(desc)
+        self.parse_desc(desc)
 
-    def parse(self, desc):
+    def parse_desc(self, desc):
 
         self.name = desc.find(SNS('name')).text
         self.identifier = utils.normalize(self.name)
