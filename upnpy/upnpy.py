@@ -12,8 +12,6 @@ import sys, time, select, logging
 import gevent, gevent.monkey
 gevent.monkey.patch_all()
 
-from ssdp import SSDPServer
-from http import HTTPConnection, HTTPSConnection
 from device import _RootList
 
 class Upnpy(object):
@@ -32,13 +30,30 @@ class Upnpy(object):
         self._subscriptions = weakref.WeakValueDictionary()
         self.devices = _RootList(self)
 
-        self.ssdp = SSDPServer(self)
-        self.http = None
-        self.https = None
-
         self._stop = False
         import atexit
         atexit.register(self.clean)
+
+    def __getattr__(self, attr):
+        if attr is 'ssdp':
+            from ssdp import SSDPServer
+            self.ssdp = SSDPServer(self)
+            return self.ssdp
+
+        elif attr is 'http':
+            from http import HTTPServer
+            self.http = HTTPServer(self)
+            return self.http
+
+        elif attr is 'https':
+            from http import HTTPServer
+            self.https = HTTPServer(self, True)
+            return self.https
+
+        else:
+            raise AttributeError("'%s' has no attribute %r" %
+                                 (self.__class__.__name__, attr))
+
 
     def search(self, target, timeout=2.0):
         """search for devices/services

@@ -631,14 +631,6 @@ class _RootList(dict):
             import protection
             device.services['_protection'] = protection.Service()
 
-        if not self.upnpy.http:
-            from http import HTTPServer
-            self.upnpy.http = HTTPServer(self.upnpy)
-
-        if not self.upnpy.https and device._protection:
-            from http import HTTPServer
-            self.upnpy.https = HTTPServer(self.upnpy, ssl=True)
-
         self.upnpy.ssdp.advertise(device)
 
         for i, s in device.services.items():

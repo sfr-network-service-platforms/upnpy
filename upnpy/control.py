@@ -413,7 +413,7 @@ class StateVariable(utils.StateVariable):
 
 class Subscription(object):
     
-    EXPIRY = 300
+    EXPIRY = 100
 
     def __init__(self, service):
         import weakref
@@ -426,10 +426,6 @@ class Subscription(object):
         self.subscribe()
     
     def subscribe(self):
-
-        if not self.upnpy.http:
-            from http import HTTPServer
-            self.upnpy.http = HTTPServer(self.upnpy)
 
         headers = dict(TIMEOUT='Second-%d'%self.EXPIRY)
         if self.sid:
@@ -457,14 +453,14 @@ class Subscription(object):
                 return self.subscribe()
             return self.service._logger.warning('subscription error : %d %s', response.status, response.reason)
         
-        self.sid = response.getheader('SID', self.sid or None)
+        self.sid = response.getheader('SID', self.sid)
         if self.sid is None:
             return self.service._logger.warning('subscription error : no SID')
 
         self.upnpy._subscriptions[self.sid] = self
 
         expiry = int(response.getheader('TIMEOUT', '-%d' % self.EXPIRY).split('-')[1])
-        if self.alarm:
+        if self.alarm and self.alarm != gevent.getcurrent():
             self.alarm.kill()
 
         self.alarm = gevent.spawn_later(expiry/2, self.renew, True)
