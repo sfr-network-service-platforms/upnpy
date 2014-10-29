@@ -90,6 +90,10 @@ class Upnpy(object):
         else:
             raise KeyError("UPnP '%s' not found" % target)
 
+    def serve_forever(self):
+        gevent.wait()
+
+
     def add_handler(self, handler):
         self.ssdp.add_handler(handler)
 

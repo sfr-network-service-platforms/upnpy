@@ -12,7 +12,6 @@ sys.path += ['.']
 import upnpy
 from upnpy.device import BaseService, BaseDevice, StateVariable, action, ActionError, _TextElement, _getURL
 from upnpy import utils
-import gevent
 
 try:
     from xml.etree import cElementTree as ElementTree
@@ -219,7 +218,7 @@ def main():
     u.devices['BasicMediaServer'] = BasicMediaServer(content_path=unicode(path))
     #u.devices['BasicMediaServer'].services['contentDirectory'].A_ARG_TYPE_UpdateID = 5
 
-    gevent.wait()
+    upnpy.server_forever()
 
 if __name__ == '__main__':
     main()
